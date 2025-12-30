@@ -74,7 +74,7 @@ func createObjectStoreBucket(ctx context.Context, t *testing.T, natsURL, cluster
 	require.NoError(t, err)
 
 	bucketName := "convex." + clusterID + ".wal"
-	_, err = js.CreateObjectStore(ctx, jetstream.ObjectStoreConfig{Name: bucketName})
+	_, err = js.CreateObjectStore(ctx, jetstream.ObjectStoreConfig{Bucket: bucketName})
 	if err != nil {
 		// Bucket may already exist, try to get it
 		_, err = js.ObjectStore(ctx, bucketName)
