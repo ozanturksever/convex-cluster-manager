@@ -10,3 +10,4 @@ devenv.local.nix
 
 # GoReleaser
 dist/
+.codebuff

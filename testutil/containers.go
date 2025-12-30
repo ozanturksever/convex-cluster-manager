@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/docker/docker/api/types/container"
+	"github.com/nats-io/nats.go"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
 )
@@ -60,6 +61,15 @@ func (n *NATSContainer) Stop(ctx context.Context) error {
 		return n.Container.Terminate(ctx)
 	}
 	return nil
+}
+
+// NATSConnect creates a NATS connection with standard options.
+func NATSConnect(url string) (*nats.Conn, error) {
+	return nats.Connect(url,
+		nats.MaxReconnects(-1),
+		nats.ReconnectWait(100*time.Millisecond),
+		nats.Timeout(5*time.Second),
+	)
 }
 
 // SystemdContainer represents a running systemd-enabled container.
