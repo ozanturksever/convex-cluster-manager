@@ -461,31 +461,49 @@ func TestDaemonRoleTransitionsUpdateHealth(t *testing.T) {
 	// Create Object Store bucket for WAL replication
 	createObjectStoreBucket(ctx, t, natsContainer.URL, clusterID)
 
-	// Create test config
-	cfg := createTestConfig(t, tmpDir, natsContainer.URL, clusterID, "node-1")
+	// Create test configs for TWO nodes - a single node will immediately re-elect itself
+	// after stepping down, making the test flaky. With two nodes, when node-1 fails,
+	// node-2 will take over leadership.
+	cfg1 := createTestConfig(t, tmpDir, natsContainer.URL, clusterID, "node-1")
+	cfg2 := createTestConfig(t, tmpDir, natsContainer.URL, clusterID, "node-2")
 
-	// Create daemon
-	daemon, err := NewDaemon(cfg)
+	// Create daemons
+	daemon1, err := NewDaemon(cfg1)
 	require.NoError(t, err)
 
-	// Run daemon in background
-	daemonCtx, daemonCancel := context.WithCancel(ctx)
-	defer daemonCancel()
+	daemon2, err := NewDaemon(cfg2)
+	require.NoError(t, err)
 
-	errCh := make(chan error, 1)
+	// Run daemon 1 in background
+	daemon1Ctx, daemon1Cancel := context.WithCancel(ctx)
+
+	errCh1 := make(chan error, 1)
 	go func() {
-		errCh <- daemon.Run(daemonCtx)
+		errCh1 <- daemon1.Run(daemon1Ctx)
 	}()
 
-	// Wait for the node to become leader
+	// Wait for node 1 to become leader
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
-		if daemon.state.Role() == RolePrimary {
+		if daemon1.state.Role() == RolePrimary {
 			break
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	require.Equal(t, RolePrimary, daemon.state.Role())
+	require.Equal(t, RolePrimary, daemon1.state.Role(), "node-1 should become leader")
+
+	// Run daemon 2 in background
+	daemon2Ctx, daemon2Cancel := context.WithCancel(ctx)
+	defer daemon2Cancel()
+
+	errCh2 := make(chan error, 1)
+	go func() {
+		errCh2 <- daemon2.Run(daemon2Ctx)
+	}()
+
+	// Give daemon 2 time to start
+	time.Sleep(2 * time.Second)
+	require.Equal(t, RolePassive, daemon2.state.Role(), "node-2 should be passive")
 
 	// Create a client to query health
 	clientCfg := health.Config{
@@ -500,40 +518,52 @@ func TestDaemonRoleTransitionsUpdateHealth(t *testing.T) {
 	require.NoError(t, err)
 	defer client.Stop()
 
-	// Query health when PRIMARY
+	// Query health when node-1 is PRIMARY
 	resp, err := client.QueryNode(ctx, "node-1", 5*time.Second)
 	require.NoError(t, err)
 	assert.Equal(t, "PRIMARY", resp.Role)
 	assert.Equal(t, "node-1", resp.Leader)
 
-	// Step down from leadership
-	err = daemon.election.StepDown(ctx)
+	// Query health when node-2 is PASSIVE
+	resp, err = client.QueryNode(ctx, "node-2", 5*time.Second)
 	require.NoError(t, err)
+	assert.Equal(t, "PASSIVE", resp.Role)
+	assert.Equal(t, "node-1", resp.Leader)
 
-	// Wait for state to transition to PASSIVE
-	deadline = time.Now().Add(10 * time.Second)
+	// Stop daemon1 to simulate failure - node-2 will take over after TTL expires
+	daemon1Cancel()
+	select {
+	case <-errCh1:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timeout waiting for daemon1 to stop")
+	}
+
+	// Wait for node-2 to become leader (after leader TTL expires)
+	deadline = time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
-		if daemon.state.Role() == RolePassive {
+		if daemon2.state.Role() == RolePrimary {
 			break
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
+	require.Equal(t, RolePrimary, daemon2.state.Role(), "node-2 should become leader after node-1 fails")
 
 	// Give health checker time to update
 	time.Sleep(500 * time.Millisecond)
 
-	// Query health when PASSIVE
-	resp, err = client.QueryNode(ctx, "node-1", 5*time.Second)
+	// Query health - node-2 should now be PRIMARY
+	resp, err = client.QueryNode(ctx, "node-2", 5*time.Second)
 	require.NoError(t, err)
-	assert.Equal(t, "PASSIVE", resp.Role)
+	assert.Equal(t, "PRIMARY", resp.Role, "node-2 health should report PRIMARY after failover")
+	assert.Equal(t, "node-2", resp.Leader)
 
-	// Shutdown daemon
-	daemonCancel()
+	// Shutdown daemon2
+	daemon2Cancel()
 
 	select {
-	case <-errCh:
+	case <-errCh2:
 	case <-time.After(10 * time.Second):
-		t.Fatal("timeout waiting for daemon to stop")
+		t.Fatal("timeout waiting for daemon2 to stop")
 	}
 }
 
