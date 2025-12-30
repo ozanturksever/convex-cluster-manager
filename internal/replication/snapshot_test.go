@@ -132,7 +132,7 @@ func TestSnapshotterStartStopIdempotent(t *testing.T) {
 	// Start NATS container with JetStream enabled.
 	natsContainer, err := testutil.StartNATSContainer(ctx)
 	require.NoError(t, err)
-	defer natsContainer.Stop(ctx)
+	defer func() { _ = natsContainer.Stop(ctx) }()
 
 	// Connect and create the Object Store bucket expected by the replica client.
 	nc, err := nats.Connect(natsContainer.URL)
@@ -195,7 +195,7 @@ func TestSnapshotterCreatesSnapshotsAndEnforcesRetention(t *testing.T) {
 	// Start NATS container with JetStream enabled.
 	natsContainer, err := testutil.StartNATSContainer(ctx)
 	require.NoError(t, err)
-	defer natsContainer.Stop(ctx)
+	defer func() { _ = natsContainer.Stop(ctx) }()
 
 	// Connect to NATS and create the Object Store bucket used by the snapshotter.
 	nc, err := nats.Connect(natsContainer.URL)
@@ -246,7 +246,7 @@ func TestSnapshotterCreatesSnapshotsAndEnforcesRetention(t *testing.T) {
 	require.NoError(t, err)
 
 	require.NoError(t, snap.Start(ctx))
-	defer snap.Stop(context.Background())
+	defer func() { _ = snap.Stop(context.Background()) }()
 
 	// Allow litestream to fully initialize (read page size from SQLite header, start sync monitors).
 	time.Sleep(2 * time.Second)

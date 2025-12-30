@@ -298,7 +298,7 @@ func (d *Daemon) handleStepDown() {
 // state callbacks.
 func (d *Daemon) Run(ctx context.Context) error {
 	d.setCtx(ctx)
-	defer d.setCtx(nil)
+	defer d.setCtx(context.Background())
 
 	d.logger.Info("daemon starting")
 

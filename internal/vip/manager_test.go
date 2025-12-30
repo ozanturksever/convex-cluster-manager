@@ -24,7 +24,7 @@ func TestVIPManager(t *testing.T) {
 	if err != nil {
 		t.Skipf("skipping test: failed to start systemd container: %v", err)
 	}
-	defer systemdContainer.Stop(ctx)
+	defer func() { _ = systemdContainer.Stop(ctx) }()
 
 	// Wait for systemd to be ready
 	time.Sleep(3 * time.Second)

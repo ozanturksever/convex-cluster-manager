@@ -92,7 +92,7 @@ func TestDaemonSingleNodeBecomesLeader(t *testing.T) {
 	// Start NATS container
 	natsContainer, err := testutil.StartNATSContainer(ctx)
 	require.NoError(t, err)
-	defer natsContainer.Stop(ctx)
+	defer func() { _ = natsContainer.Stop(ctx) }()
 
 	clusterID := "daemon-single-node"
 	tmpDir := t.TempDir()
@@ -151,7 +151,7 @@ func TestDaemonTwoNodeFailover(t *testing.T) {
 	// Start NATS container
 	natsContainer, err := testutil.StartNATSContainer(ctx)
 	require.NoError(t, err)
-	defer natsContainer.Stop(ctx)
+	defer func() { _ = natsContainer.Stop(ctx) }()
 
 	clusterID := "daemon-two-node-failover"
 	tmpDir := t.TempDir()
@@ -249,7 +249,7 @@ func TestDaemonGracefulStepdown(t *testing.T) {
 	// Start NATS container
 	natsContainer, err := testutil.StartNATSContainer(ctx)
 	require.NoError(t, err)
-	defer natsContainer.Stop(ctx)
+	defer func() { _ = natsContainer.Stop(ctx) }()
 
 	clusterID := "daemon-graceful-stepdown"
 	tmpDir := t.TempDir()
@@ -354,7 +354,7 @@ func TestDaemonHealthCheckerCrossNodeQuery(t *testing.T) {
 	// Start NATS container
 	natsContainer, err := testutil.StartNATSContainer(ctx)
 	require.NoError(t, err)
-	defer natsContainer.Stop(ctx)
+	defer func() { _ = natsContainer.Stop(ctx) }()
 
 	clusterID := "daemon-health-query"
 	tmpDir := t.TempDir()
@@ -462,7 +462,7 @@ func TestDaemonRoleTransitionsUpdateHealth(t *testing.T) {
 	// Start NATS container
 	natsContainer, err := testutil.StartNATSContainer(ctx)
 	require.NoError(t, err)
-	defer natsContainer.Stop(ctx)
+	defer func() { _ = natsContainer.Stop(ctx) }()
 
 	clusterID := "daemon-role-transitions"
 	tmpDir := t.TempDir()

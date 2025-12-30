@@ -21,7 +21,7 @@ func TestElection(t *testing.T) {
 	// Start NATS container
 	natsContainer, err := testutil.StartNATSContainer(ctx)
 	require.NoError(t, err)
-	defer natsContainer.Stop(ctx)
+	defer func() { _ = natsContainer.Stop(ctx) }()
 
 	t.Run("single node becomes leader", func(t *testing.T) {
 		cfg := ElectionConfig{

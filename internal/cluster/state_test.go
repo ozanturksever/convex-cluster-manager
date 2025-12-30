@@ -38,7 +38,7 @@ func TestStateTransitions(t *testing.T) {
 
 	t.Run("transition to passive when stepping down", func(t *testing.T) {
 		state := NewState("node-1", "cluster-1")
-		state.BecomeLeader()
+		_ = state.BecomeLeader()
 
 		err := state.StepDown()
 		assert.NoError(t, err)
@@ -56,7 +56,7 @@ func TestStateTransitions(t *testing.T) {
 
 	t.Run("cannot become leader if already primary", func(t *testing.T) {
 		state := NewState("node-1", "cluster-1")
-		state.BecomeLeader()
+		_ = state.BecomeLeader()
 
 		err := state.BecomeLeader()
 		assert.Error(t, err)
@@ -84,7 +84,7 @@ func TestStateTransitions(t *testing.T) {
 func TestVIPState(t *testing.T) {
 	t.Run("acquire VIP when becoming primary", func(t *testing.T) {
 		state := NewState("node-1", "cluster-1")
-		state.BecomeLeader()
+		_ = state.BecomeLeader()
 
 		state.SetVIPAcquired(true)
 		assert.True(t, state.HasVIP())
@@ -92,10 +92,10 @@ func TestVIPState(t *testing.T) {
 
 	t.Run("release VIP when stepping down", func(t *testing.T) {
 		state := NewState("node-1", "cluster-1")
-		state.BecomeLeader()
+		_ = state.BecomeLeader()
 		state.SetVIPAcquired(true)
 
-		state.StepDown()
+		_ = state.StepDown()
 		state.SetVIPAcquired(false)
 		assert.False(t, state.HasVIP())
 	})
@@ -110,20 +110,20 @@ func TestStateCallbacks(t *testing.T) {
 			called = true
 		})
 
-		state.BecomeLeader()
+		_ = state.BecomeLeader()
 		assert.True(t, called)
 	})
 
 	t.Run("calls OnStepDown callback", func(t *testing.T) {
 		state := NewState("node-1", "cluster-1")
-		state.BecomeLeader()
+		_ = state.BecomeLeader()
 
 		called := false
 		state.OnStepDown(func() {
 			called = true
 		})
 
-		state.StepDown()
+		_ = state.StepDown()
 		assert.True(t, called)
 	})
 
@@ -176,7 +176,7 @@ func TestStateConcurrency(t *testing.T) {
 func TestIsLeader(t *testing.T) {
 	t.Run("returns true when this node is leader", func(t *testing.T) {
 		state := NewState("node-1", "cluster-1")
-		state.BecomeLeader()
+		_ = state.BecomeLeader()
 
 		assert.True(t, state.IsLeader())
 	})

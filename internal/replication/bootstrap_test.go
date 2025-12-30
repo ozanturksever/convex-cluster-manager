@@ -115,7 +115,7 @@ func TestBootstrap_NoSnapshotsAvailable(t *testing.T) {
 	// Start NATS container with JetStream enabled.
 	natsContainer, err := testutil.StartNATSContainer(ctx)
 	require.NoError(t, err)
-	defer natsContainer.Stop(ctx)
+	defer func() { _ = natsContainer.Stop(ctx) }()
 
 	// Connect and create an empty Object Store bucket.
 	nc, err := nats.Connect(natsContainer.URL)
@@ -155,7 +155,7 @@ func TestBootstrap_RestoresFromSnapshot(t *testing.T) {
 	// Start NATS container with JetStream enabled.
 	natsContainer, err := testutil.StartNATSContainer(ctx)
 	require.NoError(t, err)
-	defer natsContainer.Stop(ctx)
+	defer func() { _ = natsContainer.Stop(ctx) }()
 
 	// Connect to NATS and create the Object Store bucket.
 	nc, err := nats.Connect(natsContainer.URL)
@@ -216,7 +216,7 @@ func TestBootstrap_RestoresFromSnapshot(t *testing.T) {
 	require.NoError(t, err)
 
 	require.NoError(t, snap.Start(ctx))
-	defer snap.Stop(context.Background())
+	defer func() { _ = snap.Stop(context.Background()) }()
 
 	// Allow litestream to fully initialize.
 	time.Sleep(2 * time.Second)
@@ -280,7 +280,7 @@ func TestBootstrap_RestoresWithPrimaryReplication(t *testing.T) {
 	// Start NATS container with JetStream enabled.
 	natsContainer, err := testutil.StartNATSContainer(ctx)
 	require.NoError(t, err)
-	defer natsContainer.Stop(ctx)
+	defer func() { _ = natsContainer.Stop(ctx) }()
 
 	// Connect to NATS and create the Object Store bucket.
 	nc, err := nats.Connect(natsContainer.URL)
@@ -322,7 +322,7 @@ func TestBootstrap_RestoresWithPrimaryReplication(t *testing.T) {
 	require.NoError(t, err)
 
 	require.NoError(t, primary.Start(ctx))
-	defer primary.Stop(context.Background())
+	defer func() { _ = primary.Stop(context.Background()) }()
 
 	// Allow litestream to fully initialize.
 	time.Sleep(2 * time.Second)

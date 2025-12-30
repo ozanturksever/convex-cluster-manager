@@ -83,7 +83,7 @@ func TestPrimaryStartStopIdempotent(t *testing.T) {
 	// Start NATS container with JetStream enabled.
 	natsContainer, err := testutil.StartNATSContainer(ctx)
 	require.NoError(t, err)
-	defer natsContainer.Stop(ctx)
+	defer func() { _ = natsContainer.Stop(ctx) }()
 
 	// Connect and create the Object Store bucket expected by the replica client.
 	nc, err := nats.Connect(natsContainer.URL)
@@ -142,7 +142,7 @@ func TestPrimaryReplicatesWALToNATS(t *testing.T) {
 	// Start NATS container with JetStream enabled.
 	natsContainer, err := testutil.StartNATSContainer(ctx)
 	require.NoError(t, err)
-	defer natsContainer.Stop(ctx)
+	defer func() { _ = natsContainer.Stop(ctx) }()
 
 	// Connect to NATS and create the Object Store bucket used by the primary.
 	nc, err := nats.Connect(natsContainer.URL)
@@ -183,7 +183,7 @@ func TestPrimaryReplicatesWALToNATS(t *testing.T) {
 	require.NoError(t, err)
 
 	require.NoError(t, primary.Start(ctx))
-	defer primary.Stop(context.Background())
+	defer func() { _ = primary.Stop(context.Background()) }()
 
 	// Allow litestream to fully initialize its internal state (monitors, shadow WAL, etc.)
 	time.Sleep(2 * time.Second)

@@ -38,13 +38,13 @@ func StartNATSContainer(ctx context.Context) (*NATSContainer, error) {
 
 	host, err := container.Host(ctx)
 	if err != nil {
-		container.Terminate(ctx)
+		_ = container.Terminate(ctx)
 		return nil, fmt.Errorf("failed to get NATS container host: %w", err)
 	}
 
 	port, err := container.MappedPort(ctx, "4222")
 	if err != nil {
-		container.Terminate(ctx)
+		_ = container.Terminate(ctx)
 		return nil, fmt.Errorf("failed to get NATS container port: %w", err)
 	}
 

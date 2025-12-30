@@ -113,9 +113,9 @@ func init() {
 	initCmd.Flags().IntVar(&initVIPNetmask, "vip-netmask", 24, "VIP netmask (CIDR notation)")
 	initCmd.Flags().StringVar(&initVIPIface, "interface", "", "Network interface for VIP")
 
-	initCmd.MarkFlagRequired("cluster-id")
-	initCmd.MarkFlagRequired("node-id")
-	initCmd.MarkFlagRequired("nats")
+	_ = initCmd.MarkFlagRequired("cluster-id")
+	_ = initCmd.MarkFlagRequired("node-id")
+	_ = initCmd.MarkFlagRequired("nats")
 }
 
 func runInit(cmd *cobra.Command, args []string) error {
