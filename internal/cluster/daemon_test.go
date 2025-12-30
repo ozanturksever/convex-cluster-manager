@@ -292,6 +292,7 @@ func TestDaemonGracefulStepdown(t *testing.T) {
 	require.Equal(t, RolePassive, daemon2.state.Role(), "node-2 should be passive")
 
 	// Have node 1 gracefully step down via election
+	// This sets a cooldown that prevents node1 from immediately re-acquiring leadership
 	err = daemon1.election.StepDown(ctx)
 	require.NoError(t, err)
 

@@ -517,14 +517,27 @@ func runDemote(cmd *cobra.Command, args []string) error {
 	}
 	defer election.Stop()
 
-	// Wait briefly to check status
+	// Wait briefly to sync with cluster state
 	time.Sleep(time.Second)
 
-	if !election.IsLeader() {
-		fmt.Println("This node is not the current leader")
+	// Check if this node is the current leader by looking at the KV store.
+	// Note: We check CurrentLeader() instead of IsLeader() because IsLeader()
+	// only returns true if THIS Election instance acquired leadership.
+	// The running daemon has its own Election instance that holds leadership.
+	currentLeader := election.CurrentLeader()
+	if currentLeader != cfg.NodeID {
+		if currentLeader == "" {
+			fmt.Println("No leader currently exists in the cluster")
+		} else {
+			fmt.Printf("This node is not the current leader (leader is %s)\n", currentLeader)
+		}
 		return nil
 	}
 
+	// This node is the leader according to KV. Call StepDown which will:
+	// 1. Set a cooldown marker to prevent this node from re-acquiring leadership
+	// 2. Delete the leader key from KV
+	// The running daemon will detect the key deletion and transition to passive.
 	if err := election.StepDown(ctx); err != nil {
 		return fmt.Errorf("failed to step down: %w", err)
 	}

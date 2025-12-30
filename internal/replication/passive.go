@@ -144,14 +144,26 @@ func (p *Passive) Running() bool {
 func (p *Passive) CatchUp(ctx context.Context) error {
 	p.mu.Lock()
 	replica := p.replica
+	client := p.client
 	running := p.running
 	p.mu.Unlock()
 
 	if !running {
 		return fmt.Errorf("passive replication not started")
 	}
-	if replica == nil {
+	if replica == nil || client == nil {
 		return fmt.Errorf("replica not initialized")
+	}
+
+	// Initialize the NATS client connection before attempting restore.
+	// This ensures the connection is established and object store is accessible.
+	if err := client.Init(ctx); err != nil {
+		// Check if this is a "no bucket" or similar situation - not an error for passive.
+		if isPassiveNoSnapshotsError(err) {
+			p.logger.Debug("NATS object store not ready yet", "error", err)
+			return nil
+		}
+		return fmt.Errorf("init nats client: %w", err)
 	}
 
 	// Restore to a temporary file first, then atomically move into place.
@@ -237,12 +249,22 @@ func (p *Passive) CatchUp(ctx context.Context) error {
 func (p *Passive) ReplicationLag(ctx context.Context) (time.Duration, error) {
 	p.mu.Lock()
 	replica := p.replica
+	client := p.client
 	last := p.lastUpdated
 	running := p.running
 	p.mu.Unlock()
 
-	if !running || replica == nil {
+	if !running || replica == nil || client == nil {
 		return 0, fmt.Errorf("passive replication not started")
+	}
+
+	// Initialize the NATS client connection before querying.
+	if err := client.Init(ctx); err != nil {
+		// If no bucket available, report zero lag.
+		if isPassiveNoSnapshotsError(err) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("init nats client: %w", err)
 	}
 
 	opt := litestream.NewRestoreOptions()

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"sync"
 	"time"
 
@@ -113,6 +114,12 @@ func (e *Election) Start(ctx context.Context) error {
 	}
 	e.kv = kv
 
+	// Clear any stale cooldown for this node on startup.
+	// A fresh daemon start indicates a new session - old cooldowns are no longer relevant.
+	// This prevents cross-contamination between daemon restarts and test runs.
+	cooldownKey := fmt.Sprintf("cooldown-%s", e.cfg.NodeID)
+	_ = kv.Delete(ctx, cooldownKey)
+
 	// Try to acquire leadership immediately
 	e.tryAcquireOrRenew(ctx)
 
@@ -153,25 +160,51 @@ func (e *Election) LeaderCh() <-chan struct{} {
 }
 
 // StepDown voluntarily gives up leadership.
+// It sets a cooldown marker in KV to prevent this node from immediately
+// re-acquiring leadership, allowing other nodes to take over.
+//
+// This method can be called from:
+// 1. The daemon's Election instance (where isLeader is true)
+// 2. A CLI command's Election instance (where isLeader is false, but we still
+//    need to delete the leader key and set cooldown)
+//
+// In both cases, we proceed with deleting the leader key and setting cooldown.
 func (e *Election) StepDown(ctx context.Context) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	if !e.isLeader {
-		return nil
+	// Set a cooldown marker BEFORE deleting the leader key.
+	// This prevents this node from immediately re-acquiring leadership.
+	// The cooldown duration equals the leader TTL, which is sufficient time
+	// for other nodes to detect the missing leader and acquire leadership.
+	// Note: The cooldown key will be auto-removed by the KV bucket's TTL.
+	cooldownDuration := e.cfg.LeaderTTL
+	cooldownExpiry := time.Now().Add(cooldownDuration).UnixMilli()
+	cooldownKey := fmt.Sprintf("cooldown-%s", e.cfg.NodeID)
+	
+	// Store cooldown with TTL so it auto-expires
+	_, err := e.kv.Create(ctx, cooldownKey, []byte(strconv.FormatInt(cooldownExpiry, 10)))
+	if err != nil {
+		// If key already exists, update it
+		_, err = e.kv.Put(ctx, cooldownKey, []byte(strconv.FormatInt(cooldownExpiry, 10)))
+		if err != nil {
+			e.logger.Warn("failed to set cooldown marker", "error", err)
+			// Continue with step down anyway
+		}
 	}
 
 	// Delete the leader key
-	err := e.kv.Delete(ctx, "leader")
+	err = e.kv.Delete(ctx, "leader")
 	if err != nil && !errors.Is(err, jetstream.ErrKeyNotFound) {
 		return fmt.Errorf("failed to delete leader key: %w", err)
 	}
 
+	// Update local state (may already be false if called from CLI)
 	e.isLeader = false
 	e.currentLeader = ""
 	e.revision = 0
 
-	e.logger.Info("stepped down from leadership")
+	e.logger.Info("stepped down from leadership", "cooldown", cooldownDuration)
 	return nil
 }
 
@@ -212,11 +245,33 @@ func (e *Election) tryAcquireOrRenew(ctx context.Context) {
 }
 
 func (e *Election) tryAcquireLeadership(ctx context.Context) {
-	// Check if there's an existing leader
+	// ALWAYS check and update currentLeader first, regardless of cooldown.
+	// This ensures the cached leader value is accurate for health reporting.
 	entry, err := e.kv.Get(ctx, "leader")
 	if err == nil {
 		// There's an existing leader
-		e.currentLeader = string(entry.Value())
+		existingLeader := string(entry.Value())
+		e.currentLeader = existingLeader
+		
+		// IMPORTANT: If the existing leader is THIS node but we don't think we're
+		// the leader (e.g., after a failed renewLeadership or daemon restart),
+		// we need to reclaim leadership. This fixes the race condition where
+		// isLeader=false but currentLeader=thisNode, causing the daemon to
+		// stay PASSIVE when it should be PRIMARY.
+		if existingLeader == e.cfg.NodeID && !e.isLeader {
+			e.logger.Info("reclaiming leadership - leader key contains our node ID", 
+				"revision", entry.Revision())
+			e.isLeader = true
+			e.revision = entry.Revision()
+			
+			// Notify through channel (non-blocking)
+			select {
+			case e.leaderCh <- struct{}{}:
+			default:
+			}
+			return
+		}
+		
 		e.logger.Debug("existing leader found", "leader", e.currentLeader)
 		return
 	}
@@ -226,7 +281,17 @@ func (e *Election) tryAcquireLeadership(ctx context.Context) {
 		return
 	}
 
-	// No leader exists, try to become leader
+	// No leader exists - clear the cached leader value
+	e.currentLeader = ""
+
+	// Check if this node is in cooldown (recently stepped down).
+	// Cooldown only prevents acquiring leadership, not knowing the leader state.
+	if e.isInCooldown(ctx) {
+		e.logger.Debug("in step-down cooldown, skipping leadership acquisition")
+		return
+	}
+
+	// No leader exists and not in cooldown, try to become leader
 	rev, err := e.kv.Create(ctx, "leader", []byte(e.cfg.NodeID))
 	if err != nil {
 		// Someone else may have created it
@@ -250,6 +315,40 @@ func (e *Election) tryAcquireLeadership(ctx context.Context) {
 	case e.leaderCh <- struct{}{}:
 	default:
 	}
+}
+
+// isInCooldown checks if this node recently stepped down and should not
+// attempt to acquire leadership yet. This allows other nodes time to
+// take over leadership during graceful failover.
+func (e *Election) isInCooldown(ctx context.Context) bool {
+	cooldownKey := fmt.Sprintf("cooldown-%s", e.cfg.NodeID)
+	
+	entry, err := e.kv.Get(ctx, cooldownKey)
+	if err != nil {
+		// No cooldown key exists or error reading it
+		return false
+	}
+	
+	// Parse the expiry timestamp
+	expiryMs, err := strconv.ParseInt(string(entry.Value()), 10, 64)
+	if err != nil {
+		e.logger.Warn("invalid cooldown value", "value", string(entry.Value()))
+		// Delete invalid cooldown key
+		_ = e.kv.Delete(ctx, cooldownKey)
+		return false
+	}
+	
+	nowMs := time.Now().UnixMilli()
+	if nowMs < expiryMs {
+		// Still in cooldown
+		remainingMs := expiryMs - nowMs
+		e.logger.Debug("cooldown active", "remaining_ms", remainingMs)
+		return true
+	}
+	
+	// Cooldown expired, clean up the key
+	_ = e.kv.Delete(ctx, cooldownKey)
+	return false
 }
 
 func (e *Election) renewLeadership(ctx context.Context) {

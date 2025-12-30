@@ -178,8 +178,57 @@ func TestElection(t *testing.T) {
 		// Step down
 		err = election.StepDown(ctx)
 		require.NoError(t, err)
-
+		
+		// Verify node is in cooldown and won't immediately re-acquire
 		assert.False(t, election.IsLeader())
+		
+		// Wait a short time and verify still not leader (cooldown active)
+		time.Sleep(500 * time.Millisecond)
+		assert.False(t, election.IsLeader())
+	})
+
+	t.Run("reclaims leadership when leader key contains own node ID", func(t *testing.T) {
+		cfg := ElectionConfig{
+			ClusterID:         "test-cluster-reclaim",
+			NodeID:            "test-node",
+			NATSURLs:          []string{natsContainer.URL},
+			LeaderTTL:         5 * time.Second,
+			HeartbeatInterval: 100 * time.Millisecond,
+		}
+
+		election, err := NewElection(cfg)
+		require.NoError(t, err)
+		defer election.Stop()
+
+		err = election.Start(ctx)
+		require.NoError(t, err)
+
+		// Wait to become leader
+		select {
+		case <-election.LeaderCh():
+			assert.True(t, election.IsLeader())
+		case <-time.After(10 * time.Second):
+			t.Fatal("timeout waiting to become leader")
+		}
+		assert.Equal(t, "test-node", election.CurrentLeader())
+
+		// Simulate a failed renewal by manually clearing isLeader but keeping the KV key
+		// This simulates the race condition where renewLeadership fails
+		election.mu.Lock()
+		election.isLeader = false
+		election.revision = 0
+		election.mu.Unlock()
+
+		// Now isLeader is false but the KV key still contains our node ID
+		assert.False(t, election.IsLeader())
+		assert.Equal(t, "test-node", election.CurrentLeader())
+
+		// Wait for the next heartbeat to reclaim leadership
+		time.Sleep(200 * time.Millisecond)
+
+		// Should have reclaimed leadership
+		assert.True(t, election.IsLeader())
+		assert.Equal(t, "test-node", election.CurrentLeader())
 	})
 
 	t.Run("heartbeat renews leadership", func(t *testing.T) {

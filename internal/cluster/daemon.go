@@ -220,26 +220,66 @@ func (d *Daemon) handleBecomeLeader() {
 
 	// Perform a final catch-up on the replica before stopping passive replication.
 	// This ensures we have the latest data from the previous primary.
+	// We use a dedicated context with timeout to avoid being cancelled prematurely.
+	// We also retry multiple times to handle transient failures.
+	catchUpSucceeded := false
 	if d.passive != nil && d.passive.Running() {
 		d.logger.Info("performing final catch-up before promotion")
-		if err := d.passive.CatchUp(ctx); err != nil {
-			d.logger.Warn("final catch-up failed, continuing with promotion", "error", err)
+		
+		// Use a dedicated context with timeout for the final catch-up.
+		// This ensures we don't get cancelled by the parent context during promotion.
+		const catchUpTimeout = 30 * time.Second
+		const maxRetries = 3
+		
+		for attempt := 1; attempt <= maxRetries; attempt++ {
+			catchUpCtx, cancelCatchUp := context.WithTimeout(context.Background(), catchUpTimeout)
+			err := d.passive.CatchUp(catchUpCtx)
+			cancelCatchUp()
+			
+			if err == nil {
+				d.logger.Info("final catch-up succeeded", "attempt", attempt)
+				catchUpSucceeded = true
+				break
+			}
+			
+			d.logger.Warn("final catch-up attempt failed", 
+				"attempt", attempt, 
+				"maxRetries", maxRetries, 
+				"error", err)
+			
+			if attempt < maxRetries {
+				// Brief pause before retry
+				time.Sleep(time.Second)
+			}
+		}
+		
+		if !catchUpSucceeded {
+			d.logger.Warn("all catch-up attempts failed, will NOT promote replica to data path")
 		}
 	}
 
 	// Stop passive replication if running.
 	if d.passive != nil {
-		if err := d.passive.Stop(ctx); err != nil {
+		// Use a dedicated context for stopping to avoid cancellation issues
+		stopCtx, cancelStop := context.WithTimeout(context.Background(), 10*time.Second)
+		if err := d.passive.Stop(stopCtx); err != nil {
 			d.logger.Error("failed to stop passive replication", "error", err)
 		}
+		cancelStop()
 	}
 
-	// Promote the replica database to the data path if it contains newer data.
-	// This is critical for data integrity during failover - ensures data written
-	// to the former primary (now replicated to our replica) is preserved.
-	if err := d.promoteReplicaToData(ctx); err != nil {
-		d.logger.Error("failed to promote replica to data path", "error", err)
-		// Continue anyway - the backend will use whatever data is available
+	// Promote the replica database to the data path ONLY if catch-up succeeded.
+	// This is critical for data integrity - if catch-up failed, the replica may
+	// be stale and promoting it would overwrite newer data on the data path.
+	// In that case, we let the backend start with whatever data is available
+	// on the data path (which may be more recent than a stale replica).
+	if catchUpSucceeded {
+		if err := d.promoteReplicaToData(ctx); err != nil {
+			d.logger.Error("failed to promote replica to data path", "error", err)
+			// Continue anyway - the backend will use whatever data is available
+		}
+	} else {
+		d.logger.Warn("skipping replica promotion due to failed catch-up - using existing data path")
 	}
 
 	// Acquire VIP.
@@ -338,30 +378,34 @@ func (d *Daemon) startPrimaryReplicationWithRetry(ctx context.Context) {
 // PASSIVE. It stops primary-specific components, releases the VIP, and
 // starts passive replication and an initial catch-up.
 func (d *Daemon) handleStepDown() {
-	ctx := d.getCtx()
+	// Use a dedicated context for step-down operations to avoid cancellation issues.
+	// The parent context may be cancelled during shutdown, but we still want to
+	// complete the step-down cleanly.
+	stepDownCtx, cancelStepDown := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancelStepDown()
 
 	d.logger.Info("stepping down to PASSIVE")
 	d.health.SetRole("PASSIVE")
 
 	// Stop snapshotter first so no new snapshots are taken.
-	if err := d.snapshotter.Stop(ctx); err != nil {
+	if err := d.snapshotter.Stop(stepDownCtx); err != nil {
 		d.logger.Error("failed to stop snapshotter", "error", err)
 	}
 
 	// Stop primary replication.
-	if err := d.primary.Stop(ctx); err != nil {
+	if err := d.primary.Stop(stepDownCtx); err != nil {
 		d.logger.Error("failed to stop primary replication", "error", err)
 	}
 
 	// Stop backend service.
-	if err := d.backend.Stop(ctx); err != nil {
+	if err := d.backend.Stop(stepDownCtx); err != nil {
 		d.logger.Error("failed to stop backend service", "error", err)
 	}
 	d.health.SetBackendStatus("stopped")
 
 	// Release VIP.
 	if d.vip != nil {
-		if err := d.vip.Release(ctx); err != nil {
+		if err := d.vip.Release(stepDownCtx); err != nil {
 			d.logger.Error("failed to release VIP", "error", err)
 		} else {
 			d.state.SetVIPAcquired(false)
@@ -369,17 +413,17 @@ func (d *Daemon) handleStepDown() {
 	}
 
 	// Start passive replication & perform an initial catch-up.
-	if err := d.passive.Start(ctx); err != nil {
+	if err := d.passive.Start(stepDownCtx); err != nil {
 		d.logger.Error("failed to start passive replication", "error", err)
 		return
 	}
 
-	if err := d.passive.CatchUp(ctx); err != nil {
+	if err := d.passive.CatchUp(stepDownCtx); err != nil {
 		d.logger.Error("failed to catch up passive replica", "error", err)
 		return
 	}
 
-	if lag, err := d.passive.ReplicationLag(ctx); err == nil {
+	if lag, err := d.passive.ReplicationLag(stepDownCtx); err == nil {
 		d.health.SetReplicationLag(uint64(lag.Milliseconds()))
 	}
 }
@@ -654,22 +698,41 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 		case <-ticker.C:
 			// Periodic reconciliation between election state & local state.
+			// We check both IsLeader() (authoritative) AND CurrentLeader() == nodeID
+			// (secondary check) to handle race conditions where the election state
+			// might be temporarily inconsistent.
 			isLeader := d.election.IsLeader()
+			currentLeader := d.election.CurrentLeader()
+			
+			// This node should be PRIMARY if:
+			// 1. election.IsLeader() returns true (authoritative), OR
+			// 2. currentLeader == this node's ID (the KV store says we're leader)
+			//    This handles the case where IsLeader() might be false due to a
+			//    temporary state inconsistency (e.g., after failed renewal).
+			shouldBePrimary := isLeader || currentLeader == d.cfg.NodeID
 
-			if isLeader && d.state.Role() != RolePrimary {
+			if shouldBePrimary && d.state.Role() != RolePrimary {
+				d.logger.Info("reconciling to PRIMARY", 
+					"isLeader", isLeader, 
+					"currentLeader", currentLeader,
+					"currentRole", d.state.Role())
 				if err := d.state.BecomeLeader(); err != nil && err != ErrAlreadyLeader {
 					d.logger.Error("failed to reconcile leader role", "error", err)
 				}
-			} else if !isLeader && d.state.Role() == RolePrimary {
+			} else if !shouldBePrimary && d.state.Role() == RolePrimary {
+				d.logger.Info("reconciling to PASSIVE",
+					"isLeader", isLeader,
+					"currentLeader", currentLeader,
+					"currentRole", d.state.Role())
 				if err := d.state.StepDown(); err != nil && err != ErrNotLeader {
 					d.logger.Error("failed to reconcile passive role", "error", err)
 				}
 			}
 
-			// Keep leader information up to date.
-			newLeader := d.election.CurrentLeader()
-			if newLeader != d.state.Leader() {
-				d.state.SetLeader(newLeader)
+			// Keep leader information up to date in state.
+			// Note: This doesn't affect role - role is determined by shouldBePrimary above.
+			if currentLeader != d.state.Leader() {
+				d.state.SetLeader(currentLeader)
 			}
 
 			// When leader, ensure primary replication is running.

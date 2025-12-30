@@ -139,30 +139,36 @@ func (s *State) StepDown() error {
 	return nil
 }
 
-// SetLeader updates the current leader to another node.
+// SetLeader updates the cached leader information.
+// Note: This function does NOT change the role. Role transitions should only
+// happen through BecomeLeader() and StepDown() which are triggered by the
+// daemon's reconciliation logic. This prevents race conditions where SetLeader()
+// could force a node to PASSIVE even when it should be PRIMARY.
 func (s *State) SetLeader(nodeID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	s.leader = nodeID
-	// If another node is leader, we must be passive
-	if nodeID != s.nodeID {
-		s.role = RolePassive
-	}
+	// REMOVED: Do not modify role here. The daemon's reconciliation logic
+	// determines the correct role based on election state.
+	// Previously this had: if nodeID != s.nodeID { s.role = RolePassive }
+	// which caused race conditions during rapid failover.
 
 	if s.onLeaderChange != nil {
 		s.onLeaderChange(nodeID)
 	}
 }
 
-// ClearLeader clears the current leader.
+// ClearLeader clears the current leader information.
+// Note: This function does NOT change the role. Role transitions should only
+// happen through BecomeLeader() and StepDown().
 func (s *State) ClearLeader() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	s.leader = ""
-	// When there's no leader, we remain passive
-	s.role = RolePassive
+	// REMOVED: Do not modify role here. The daemon's reconciliation logic
+	// determines the correct role based on election state.
 
 	if s.onLeaderChange != nil {
 		s.onLeaderChange("")
