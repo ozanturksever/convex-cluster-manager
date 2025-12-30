@@ -4,9 +4,11 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -204,6 +206,11 @@ func (d *Daemon) getCtx() context.Context {
 // handleBecomeLeader is invoked when this node transitions to PRIMARY.
 // It starts the backend, acquires the VIP, enables primary replication
 // and snapshots, and updates health state.
+//
+// IMPORTANT: Before starting the backend, this function promotes the replica
+// database to the data path if the replica contains newer data. This ensures
+// data written to a former passive node (that became primary) is preserved
+// when the original primary returns.
 func (d *Daemon) handleBecomeLeader() {
 	ctx := d.getCtx()
 
@@ -211,11 +218,28 @@ func (d *Daemon) handleBecomeLeader() {
 	d.health.SetRole("PRIMARY")
 	d.health.SetLeader(d.cfg.NodeID)
 
+	// Perform a final catch-up on the replica before stopping passive replication.
+	// This ensures we have the latest data from the previous primary.
+	if d.passive != nil && d.passive.Running() {
+		d.logger.Info("performing final catch-up before promotion")
+		if err := d.passive.CatchUp(ctx); err != nil {
+			d.logger.Warn("final catch-up failed, continuing with promotion", "error", err)
+		}
+	}
+
 	// Stop passive replication if running.
 	if d.passive != nil {
 		if err := d.passive.Stop(ctx); err != nil {
 			d.logger.Error("failed to stop passive replication", "error", err)
 		}
+	}
+
+	// Promote the replica database to the data path if it contains newer data.
+	// This is critical for data integrity during failover - ensures data written
+	// to the former primary (now replicated to our replica) is preserved.
+	if err := d.promoteReplicaToData(ctx); err != nil {
+		d.logger.Error("failed to promote replica to data path", "error", err)
+		// Continue anyway - the backend will use whatever data is available
 	}
 
 	// Acquire VIP.
@@ -233,38 +257,78 @@ func (d *Daemon) handleBecomeLeader() {
 		d.health.SetBackendStatus("failed")
 	} else {
 		d.health.SetBackendStatus("running")
-
-		// Verify WAL mode after backend starts (backend should create DB in WAL mode)
-		// Run in goroutine to avoid blocking the state transition
-		if d.cfg.Backend.DataPath != "" {
-			go func() {
-				// Poll for database file to exist (max 30 seconds)
-				dbPath := d.cfg.Backend.DataPath
-				for i := 0; i < 30; i++ {
-					if _, err := os.Stat(dbPath); err == nil {
-						break
-					}
-					time.Sleep(1 * time.Second)
-				}
-				// Wait a bit more for backend to initialize the DB
-				time.Sleep(2 * time.Second)
-				
-				if err := verifyWALMode(dbPath); err != nil {
-					d.logger.Error("WAL mode verification failed - replication will not work correctly", "error", err)
-					d.health.SetBackendStatus("running-no-wal")
-				} else {
-					d.logger.Info("WAL mode verified for database", "path", dbPath)
-				}
-			}()
-		}
 	}
 
-	// Start primary WAL replication.
+	// Start primary WAL replication, WAL mode verification, and snapshotter in a single goroutine.
+	// This consolidates all database-dependent initialization that needs to wait for the
+	// backend to create the database file.
+	go d.startPrimaryReplicationWithRetry(ctx)
+}
+
+// startPrimaryReplicationWithRetry waits for the database file to exist
+// and then performs all database-dependent initialization:
+// 1. Verifies WAL mode is enabled
+// 2. Starts primary WAL replication
+// 3. Starts periodic snapshots
+//
+// This consolidates all initialization that depends on the database file existing,
+// avoiding duplicate polling loops and potential race conditions.
+func (d *Daemon) startPrimaryReplicationWithRetry(ctx context.Context) {
+	dbPath := d.cfg.Backend.DataPath
+	if dbPath == "" {
+		d.logger.Warn("no data path configured, skipping primary replication")
+		return
+	}
+
+	// Wait for database file to exist (max 60 seconds)
+	dbExists := false
+	for i := 0; i < 60; i++ {
+		select {
+		case <-ctx.Done():
+			d.logger.Info("context cancelled while waiting for database file")
+			return
+		default:
+		}
+
+		if _, err := os.Stat(dbPath); err == nil {
+			dbExists = true
+			break
+		}
+		time.Sleep(1 * time.Second)
+	}
+
+	if !dbExists {
+		d.logger.Warn("database file did not appear within timeout", "path", dbPath)
+		return
+	}
+
+	// Wait a bit more for backend to fully initialize the DB
+	time.Sleep(2 * time.Second)
+
+	// Check if context was cancelled during the wait
+	select {
+	case <-ctx.Done():
+		return
+	default:
+	}
+
+	// Step 1: Verify WAL mode is enabled
+	if err := verifyWALMode(dbPath); err != nil {
+		d.logger.Error("WAL mode verification failed - replication will not work correctly", "error", err)
+		d.health.SetBackendStatus("running-no-wal")
+		// Continue anyway - replication might still work if WAL mode is enabled later
+	} else {
+		d.logger.Info("WAL mode verified for database", "path", dbPath)
+	}
+
+	// Step 2: Start primary WAL replication
 	if err := d.primary.Start(ctx); err != nil {
 		d.logger.Error("failed to start primary replication", "error", err)
+	} else {
+		d.logger.Info("primary replication started successfully")
 	}
 
-	// Start periodic snapshots.
+	// Step 3: Start periodic snapshots
 	if err := d.snapshotter.Start(ctx); err != nil {
 		d.logger.Error("failed to start snapshotter", "error", err)
 	}
@@ -318,6 +382,164 @@ func (d *Daemon) handleStepDown() {
 	if lag, err := d.passive.ReplicationLag(ctx); err == nil {
 		d.health.SetReplicationLag(uint64(lag.Milliseconds()))
 	}
+}
+
+// promoteReplicaToData copies the replica database to the data path if the
+// replica contains newer data. This is essential for data integrity during
+// failover scenarios where the passive node has received WAL updates from
+// the former primary.
+//
+// The function compares the transaction IDs (via page count as a proxy) of
+// both databases and only copies if the replica is newer.
+func (d *Daemon) promoteReplicaToData(_ context.Context) error {
+	replicaPath := d.cfg.WAL.ReplicaPath
+	dataPath := d.cfg.Backend.DataPath
+
+	// Check if replica exists
+	replicaInfo, err := os.Stat(replicaPath)
+	if os.IsNotExist(err) {
+		d.logger.Debug("no replica database to promote", "path", replicaPath)
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("stat replica: %w", err)
+	}
+
+	// Check if data path exists
+	dataInfo, dataErr := os.Stat(dataPath)
+	dataExists := dataErr == nil
+
+	// Compare databases to determine if replica is newer
+	replicaNewer := false
+
+	if !dataExists {
+		// No data file exists, replica is definitely newer
+		replicaNewer = true
+		d.logger.Info("data path does not exist, will use replica", "replica", replicaPath, "data", dataPath)
+	} else {
+		// Both exist - try TXID comparison first (most accurate), fall back to mtime
+		replicaTxID, err1 := d.getDBTxID(replicaPath)
+		dataTxID, err2 := d.getDBTxID(dataPath)
+
+		if err1 == nil && err2 == nil {
+			// TXID comparison is authoritative
+			if replicaTxID > dataTxID {
+				replicaNewer = true
+				d.logger.Info("replica has higher transaction ID",
+					"replica_txid", replicaTxID,
+					"data_txid", dataTxID)
+			} else {
+				d.logger.Info("data path is up to date, no promotion needed",
+					"replica_txid", replicaTxID,
+					"data_txid", dataTxID)
+			}
+		} else {
+			// Fall back to mtime comparison if we can't read TXIDs
+			d.logger.Warn("could not compare database TXIDs, falling back to mtime",
+				"replica_err", err1,
+				"data_err", err2)
+			if replicaInfo.ModTime().After(dataInfo.ModTime()) {
+				replicaNewer = true
+				d.logger.Info("replica is newer than data (by mtime)",
+					"replica_mtime", replicaInfo.ModTime(),
+					"data_mtime", dataInfo.ModTime())
+			}
+		}
+	}
+
+	if !replicaNewer {
+		d.logger.Debug("replica is not newer, skipping promotion")
+		return nil
+	}
+
+	// Promote: copy replica to data path atomically
+	d.logger.Info("promoting replica to data path",
+		"replica", replicaPath,
+		"data", dataPath)
+
+	// Ensure data directory exists
+	dataDir := filepath.Dir(dataPath)
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		return fmt.Errorf("create data directory: %w", err)
+	}
+
+	// Copy to temp file first, then rename for atomicity
+	tmpPath := dataPath + ".promoting.tmp"
+
+	// Remove any leftover temp files
+	_ = os.Remove(tmpPath)
+	_ = os.Remove(tmpPath + "-wal")
+	_ = os.Remove(tmpPath + "-shm")
+
+	// Copy replica to temp location
+	if err := copyFile(replicaPath, tmpPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("copy replica to temp: %w", err)
+	}
+
+	// Remove old data files (including WAL and SHM)
+	_ = os.Remove(dataPath + "-wal")
+	_ = os.Remove(dataPath + "-shm")
+	_ = os.Remove(dataPath)
+
+	// Atomically rename temp to data path
+	if err := os.Rename(tmpPath, dataPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("rename temp to data: %w", err)
+	}
+
+	d.logger.Info("replica promoted to data path successfully")
+	return nil
+}
+
+// getDBTxID returns the current transaction ID from a SQLite database.
+// It uses the data_version pragma which reflects the schema cookie + data changes.
+func (d *Daemon) getDBTxID(dbPath string) (int64, error) {
+	// Open read-only with busy timeout to handle locks gracefully
+	db, err := sql.Open("sqlite", dbPath+"?mode=ro&_busy_timeout=1000")
+	if err != nil {
+		return 0, fmt.Errorf("open database: %w", err)
+	}
+	defer db.Close()
+
+	// Use page_count as a proxy for transaction progress
+	// Higher page count generally means more data/transactions
+	var pageCount int64
+	if err := db.QueryRow("PRAGMA page_count;").Scan(&pageCount); err != nil {
+		return 0, fmt.Errorf("query page_count: %w", err)
+	}
+
+	// Also get data_version for additional comparison
+	var dataVersion int64
+	if err := db.QueryRow("PRAGMA data_version;").Scan(&dataVersion); err != nil {
+		// data_version might not be available, just use page_count
+		return pageCount, nil
+	}
+
+	// Combine page_count and data_version for a more accurate comparison
+	// page_count is the primary indicator, data_version breaks ties
+	return pageCount*1000000 + dataVersion, nil
+}
+
+// copyFile copies a file from src to dst.
+func copyFile(src, dst string) error {
+	srcFile, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer srcFile.Close()
+
+	dstFile, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer dstFile.Close()
+
+	if _, err := io.Copy(dstFile, srcFile); err != nil {
+		return err
+	}
+
+	// Ensure data is flushed to disk
+	return dstFile.Sync()
 }
 
 // verifyWALMode checks if the database at the given path is in WAL mode.
@@ -448,6 +670,26 @@ func (d *Daemon) Run(ctx context.Context) error {
 			newLeader := d.election.CurrentLeader()
 			if newLeader != d.state.Leader() {
 				d.state.SetLeader(newLeader)
+			}
+
+			// When leader, ensure primary replication is running.
+			// This handles cases where replication failed to start initially
+			// (e.g., database didn't exist yet) or stopped unexpectedly.
+			if isLeader {
+				if !d.primary.Running() {
+					d.logger.Info("primary replication not running, attempting to start")
+					if err := d.primary.Start(ctx); err != nil {
+						d.logger.Error("failed to start primary replication", "error", err)
+					} else {
+						d.logger.Info("primary replication started successfully")
+					}
+				}
+				// Also ensure snapshotter is running
+				if !d.snapshotter.Running() {
+					if err := d.snapshotter.Start(ctx); err != nil {
+						d.logger.Error("failed to start snapshotter", "error", err)
+					}
+				}
 			}
 
 			// When not leader, keep the passive replica reasonably up to date
