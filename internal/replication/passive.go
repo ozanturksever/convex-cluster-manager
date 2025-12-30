@@ -1,0 +1,196 @@
+package replication
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"sync"
+	"time"
+
+	"github.com/benbjohnson/litestream"
+	litestreamnats "github.com/benbjohnson/litestream/nats"
+)
+
+// Passive manages WAL replication for a passive node by consuming LTX
+// files from a NATS JetStream Object Store bucket and restoring them
+// into a local shadow database.
+//
+// The Config type is shared with the primary replicator. For a passive
+// node, DBPath should be set to the shadow database path (typically
+// cfg.WAL.ReplicaPath from the cluster configuration).
+type Passive struct {
+	cfg    Config
+	logger *slog.Logger
+
+	mu          sync.Mutex
+	running     bool
+	client      *litestreamnats.ReplicaClient
+	replica     *litestream.Replica
+	lastUpdated time.Time
+}
+
+// NewPassive creates a new Passive replicator with the given configuration.
+func NewPassive(cfg Config) (*Passive, error) {
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+
+	p := &Passive{
+		cfg: cfg,
+		logger: slog.Default().With(
+			"component", "replication-passive",
+			"cluster", cfg.ClusterID,
+			"node", cfg.NodeID,
+		),
+	}
+	return p, nil
+}
+
+// BucketName returns the NATS Object Store bucket name used for WAL
+// replication for this cluster.
+func (p *Passive) BucketName() string {
+	return fmt.Sprintf("convex-%s-wal", p.cfg.ClusterID)
+}
+
+// Start initializes the replica client for the configured NATS Object
+// Store bucket. It does not perform any restore by itself; callers
+// should invoke CatchUp to apply changes to the local shadow database.
+//
+// Start is idempotent.
+func (p *Passive) Start(ctx context.Context) error { // ctx is reserved for future use
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.running {
+		return nil
+	}
+
+	if len(p.cfg.NATSURLs) == 0 {
+		return fmt.Errorf("at least one NATS URL is required")
+	}
+
+	client := litestreamnats.NewReplicaClient()
+	client.URL = p.cfg.NATSURLs[0]
+	client.BucketName = p.BucketName()
+	client.Path = p.cfg.ReplicaPath
+	if p.cfg.NATSCredentials != "" {
+		client.Creds = p.cfg.NATSCredentials
+	}
+
+	// Replica is created without an attached DB because we only use it
+	// for Restore() into the configured output path.
+	replica := litestream.NewReplica(nil)
+	replica.Client = client
+
+	p.client = client
+	p.replica = replica
+	p.running = true
+
+	p.logger.Info("passive replication started",
+		"db", p.cfg.DBPath,
+		"bucket", client.BucketName,
+		"nats", p.cfg.NATSURLs[0],
+	)
+
+	return nil
+}
+
+// Stop closes the replica client and marks the passive replicator as
+// stopped. It is safe to call Stop even if Start was never called.
+func (p *Passive) Stop(ctx context.Context) error { // ctx reserved for symmetry with Start
+	p.mu.Lock()
+	client := p.client
+	p.client = nil
+	p.replica = nil
+	p.running = false
+	p.mu.Unlock()
+
+	var err error
+	if client != nil {
+		if e := client.Close(); e != nil {
+			err = fmt.Errorf("close nats replica client: %w", e)
+		}
+	}
+
+	p.logger.Info("passive replication stopped")
+	return err
+}
+
+// Running reports whether the passive replicator has been started.
+func (p *Passive) Running() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.running
+}
+
+// CatchUp performs a one-shot restore from the remote replica into the
+// local shadow database at cfg.DBPath. It uses litestream's Restore
+// planning to choose the appropriate snapshot and WAL files, then
+// atomically replaces the local database file.
+func (p *Passive) CatchUp(ctx context.Context) error {
+	p.mu.Lock()
+	replica := p.replica
+	running := p.running
+	p.mu.Unlock()
+
+	if !running {
+		return fmt.Errorf("passive replication not started")
+	}
+	if replica == nil {
+		return fmt.Errorf("replica not initialized")
+	}
+
+	opt := litestream.NewRestoreOptions()
+	opt.OutputPath = p.cfg.DBPath
+
+	updatedAt, err := replica.CalcRestoreTarget(ctx, opt)
+	if err != nil {
+		return fmt.Errorf("calc restore target: %w", err)
+	}
+
+	if err := replica.Restore(ctx, opt); err != nil {
+		return fmt.Errorf("restore from replica: %w", err)
+	}
+
+	p.mu.Lock()
+	p.lastUpdated = updatedAt
+	p.mu.Unlock()
+
+	p.logger.Info("passive replica caught up", "updatedAt", updatedAt)
+
+	return nil
+}
+
+// ReplicationLag returns how far behind the passive node is relative to
+// the remote replica, in terms of wall-clock time between the latest
+// available LTX data and the last successfully applied restore.
+//
+// A lag of zero indicates that the last restore was performed at the
+// most recent available point in the replica. If no restore has been
+// performed yet, the lag is reported as zero.
+func (p *Passive) ReplicationLag(ctx context.Context) (time.Duration, error) {
+	p.mu.Lock()
+	replica := p.replica
+	last := p.lastUpdated
+	running := p.running
+	p.mu.Unlock()
+
+	if !running || replica == nil {
+		return 0, fmt.Errorf("passive replication not started")
+	}
+
+	opt := litestream.NewRestoreOptions()
+	updatedAt, err := replica.CalcRestoreTarget(ctx, opt)
+	if err != nil {
+		return 0, fmt.Errorf("calc restore target: %w", err)
+	}
+
+	if last.IsZero() {
+		return 0, nil
+	}
+	if !updatedAt.After(last) {
+		return 0, nil
+	}
+
+	return updatedAt.Sub(last), nil
+}
