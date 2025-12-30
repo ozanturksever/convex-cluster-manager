@@ -69,6 +69,7 @@ func TestDataIntegrity_PreFailoverDataPreserved(t *testing.T) {
 	require.NoError(t, err)
 
 	daemon1Ctx, daemon1Cancel := context.WithCancel(ctx)
+	defer daemon1Cancel()
 	daemon2Ctx, daemon2Cancel := context.WithCancel(ctx)
 	defer daemon2Cancel()
 
@@ -128,10 +129,16 @@ func TestDataIntegrity_PreFailoverDataPreserved(t *testing.T) {
 	t.Log("Triggering failover...")
 	if primaryDaemon == daemon1 {
 		daemon1Cancel()
-		<-errCh1
+		select {
+		case <-errCh1:
+		case <-time.After(10 * time.Second):
+		}
 	} else {
 		daemon2Cancel()
-		<-errCh2
+		select {
+		case <-errCh2:
+		case <-time.After(10 * time.Second):
+		}
 	}
 
 	// Wait for recovery
@@ -234,6 +241,7 @@ func TestDataIntegrity_PostFailoverWritesWork(t *testing.T) {
 	require.NoError(t, err)
 
 	daemon1Ctx, daemon1Cancel := context.WithCancel(ctx)
+	defer daemon1Cancel()
 	daemon2Ctx, daemon2Cancel := context.WithCancel(ctx)
 	defer daemon2Cancel()
 
@@ -258,10 +266,16 @@ func TestDataIntegrity_PostFailoverWritesWork(t *testing.T) {
 	t.Log("Triggering failover...")
 	if primaryDaemon == daemon1 {
 		daemon1Cancel()
-		<-errCh1
+		select {
+		case <-errCh1:
+		case <-time.After(10 * time.Second):
+		}
 	} else {
 		daemon2Cancel()
-		<-errCh2
+		select {
+		case <-errCh2:
+		case <-time.After(10 * time.Second):
+		}
 	}
 
 	// Wait for new primary to stabilize
@@ -335,6 +349,7 @@ func TestDataIntegrity_ConcurrentWritesDuringFailover(t *testing.T) {
 	require.NoError(t, err)
 
 	daemon1Ctx, daemon1Cancel := context.WithCancel(ctx)
+	defer daemon1Cancel()
 	daemon2Ctx, daemon2Cancel := context.WithCancel(ctx)
 	defer daemon2Cancel()
 
@@ -401,10 +416,16 @@ func TestDataIntegrity_ConcurrentWritesDuringFailover(t *testing.T) {
 	t.Log("Triggering failover during concurrent writes...")
 	if primaryDaemon == daemon1 {
 		daemon1Cancel()
-		<-errCh1
+		select {
+		case <-errCh1:
+		case <-time.After(10 * time.Second):
+		}
 	} else {
 		daemon2Cancel()
-		<-errCh2
+		select {
+		case <-errCh2:
+		case <-time.After(10 * time.Second):
+		}
 	}
 
 	// Let remaining writes complete/fail

@@ -765,17 +765,3 @@ func waitForLeader(t *testing.T, daemon1, daemon2 *Daemon, timeout time.Duration
 	}
 	t.Fatal("Timeout waiting for leader election")
 }
-
-// waitForRole waits for a daemon to reach a specific role with timeout.
-func waitForRole(t *testing.T, daemon *Daemon, expectedRole Role, timeout time.Duration) bool {
-	t.Helper()
-
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if daemon.state.Role() == expectedRole {
-			return true
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	return false
-}

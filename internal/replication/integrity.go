@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"io"
 	"log/slog"
 	"os"
 
@@ -341,13 +340,4 @@ func (ic *IntegrityChecker) CompareWithReplica(ctx context.Context) (localTXID, 
 	)
 
 	return localTXID, replicaTXID, match, nil
-}
-
-// ltxReader wraps io.ReadCloser to satisfy the Reader interface needed by ValidateLTX.
-type ltxReader struct {
-	io.ReadCloser
-}
-
-func (r *ltxReader) Read(p []byte) (n int, err error) {
-	return r.ReadCloser.Read(p)
 }

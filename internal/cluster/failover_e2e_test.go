@@ -72,6 +72,7 @@ func TestFailoverWithRPORTOValidation(t *testing.T) {
 
 	// Start both daemons
 	daemon1Ctx, daemon1Cancel := context.WithCancel(ctx)
+	defer daemon1Cancel()
 	daemon2Ctx, daemon2Cancel := context.WithCancel(ctx)
 	defer daemon2Cancel()
 
@@ -232,14 +233,15 @@ func TestFailoverDataIntegrity(t *testing.T) {
 	require.NoError(t, err)
 
 	daemon1Ctx, daemon1Cancel := context.WithCancel(ctx)
-	_, daemon2Cancel := context.WithCancel(ctx)
+	defer daemon1Cancel()
+	daemon2Ctx, daemon2Cancel := context.WithCancel(ctx)
 	defer daemon2Cancel()
 
 	errCh1 := make(chan error, 1)
 	errCh2 := make(chan error, 1)
 
 	go func() { errCh1 <- daemon1.Run(daemon1Ctx) }()
-	go func() { errCh2 <- daemon2.Run(daemon1Ctx) }()
+	go func() { errCh2 <- daemon2.Run(daemon2Ctx) }()
 
 	waitForLeader(t, daemon1, daemon2, 20*time.Second)
 
@@ -380,7 +382,7 @@ func TestIntegrityCheckerDuringFailover(t *testing.T) {
 	// Wait for replication
 	time.Sleep(3 * time.Second)
 
-	primary.Stop(ctx)
+	_ = primary.Stop(ctx)
 
 	// Create integrity checker
 	checker, err := replication.NewIntegrityChecker(primaryCfg)
