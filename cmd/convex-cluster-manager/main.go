@@ -16,6 +16,7 @@ import (
 
 	"github.com/ozanturksever/convex-cluster-manager/internal/cluster"
 	"github.com/ozanturksever/convex-cluster-manager/internal/config"
+	"github.com/ozanturksever/convex-cluster-manager/internal/health"
 	"github.com/ozanturksever/convex-cluster-manager/internal/replication"
 )
 
@@ -357,39 +358,7 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	// Create election to connect to cluster
-	election, err := cluster.NewElection(cluster.ElectionConfig{
-		ClusterID:         cfg.ClusterID,
-		NodeID:            cfg.NodeID,
-		NATSURLs:          cfg.NATS.Servers,
-		NATSCredentials:   cfg.NATS.Credentials,
-		LeaderTTL:         cfg.Election.LeaderTTL,
-		HeartbeatInterval: cfg.Election.HeartbeatInterval,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to create election: %w", err)
-	}
-
-	if err := election.Start(ctx); err != nil {
-		return fmt.Errorf("failed to connect to cluster: %w", err)
-	}
-	defer election.Stop()
-
-	// Wait briefly to detect current state
-	time.Sleep(2 * time.Second)
-
-	// Determine role
-	role := "PASSIVE"
-	if election.IsLeader() {
-		role = "PRIMARY"
-	}
-
-	leader := election.CurrentLeader()
-	if leader == "" {
-		leader = "(none)"
-	}
-
-	// Print status
+	// Print header
 	fmt.Println("Cluster Status")
 	fmt.Println("==============")
 	fmt.Println()
@@ -400,13 +369,56 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		fmt.Printf("VIP:         %s/%d\n", cfg.VIP.Address, cfg.VIP.Netmask)
 	}
 	fmt.Println()
-	fmt.Printf("Role:        %s\n", role)
+
+	// Try to query the running daemon via NATS health checker first.
+	// This gives us the actual daemon state without interfering with elections.
+	healthCfg := health.Config{
+		ClusterID: cfg.ClusterID,
+		NodeID:    cfg.NodeID + "-status-query", // Use different node ID to not interfere
+		NATSURLs:  cfg.NATS.Servers,
+	}
+	checker, err := health.NewChecker(healthCfg)
+	if err != nil {
+		return fmt.Errorf("failed to create health checker: %w", err)
+	}
+
+	if err := checker.Start(ctx); err != nil {
+		return fmt.Errorf("failed to start health checker: %w", err)
+	}
+	defer checker.Stop()
+
+	// Query this node's daemon health status
+	resp, err := checker.QueryNode(ctx, cfg.NodeID, 5*time.Second)
+	if err != nil {
+		// If we can't reach the daemon, fall back to just showing the leader from KV
+		fmt.Printf("Role:        UNKNOWN (daemon not responding)\n")
+		fmt.Printf("Leader:      (could not query)\n")
+		fmt.Println()
+		fmt.Println("Note: The daemon may not be running on this node.")
+		fmt.Println("      Start it with: convex-cluster-manager daemon")
+		return nil
+	}
+
+	// Display daemon's reported status
+	fmt.Printf("Role:        %s\n", resp.Role)
+	leader := resp.Leader
+	if leader == "" {
+		leader = "(none)"
+	}
 	fmt.Printf("Leader:      %s\n", leader)
 
-	// Check if VIP is held (simplified check)
+	if resp.BackendStatus != "" {
+		fmt.Printf("Backend:     %s\n", resp.BackendStatus)
+	}
+
+	if resp.ReplicationLag > 0 {
+		fmt.Printf("Rep. Lag:    %dms\n", resp.ReplicationLag)
+	}
+
+	// Check if VIP is held
 	if cfg.VIP.Address != "" {
 		vipStatus := "not held"
-		if election.IsLeader() {
+		if resp.Role == "PRIMARY" {
 			vipStatus = "held (this node is PRIMARY)"
 		}
 		fmt.Printf("VIP Status:  %s\n", vipStatus)

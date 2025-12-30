@@ -2,8 +2,12 @@ package replication
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -69,6 +73,12 @@ func (p *Passive) Start(ctx context.Context) error { // ctx is reserved for futu
 		return fmt.Errorf("at least one NATS URL is required")
 	}
 
+	// Ensure the replica database directory exists.
+	dbDir := filepath.Dir(p.cfg.DBPath)
+	if err := os.MkdirAll(dbDir, 0755); err != nil {
+		return fmt.Errorf("create replica directory: %w", err)
+	}
+
 	client := litestreamnats.NewReplicaClient()
 	client.URL = p.cfg.NATSURLs[0]
 	client.BucketName = p.BucketName()
@@ -127,6 +137,10 @@ func (p *Passive) Running() bool {
 // local shadow database at cfg.DBPath. It uses litestream's Restore
 // planning to choose the appropriate snapshot and WAL files, then
 // atomically replaces the local database file.
+//
+// If no snapshots are available yet (e.g., new cluster or primary hasn't
+// synced yet), CatchUp returns nil without error - the passive node will
+// retry on the next catch-up cycle.
 func (p *Passive) CatchUp(ctx context.Context) error {
 	p.mu.Lock()
 	replica := p.replica
@@ -140,16 +154,66 @@ func (p *Passive) CatchUp(ctx context.Context) error {
 		return fmt.Errorf("replica not initialized")
 	}
 
+	// Restore to a temporary file first, then atomically move into place.
+	// This avoids the "output path already exists" error from litestream
+	// and ensures atomic updates to the shadow database.
+	tmpPath := p.cfg.DBPath + ".tmp"
+
+	// Clean up any leftover temp file from a previous failed restore.
+	_ = os.Remove(tmpPath)
+	_ = os.Remove(tmpPath + "-wal")
+	_ = os.Remove(tmpPath + "-shm")
+
 	opt := litestream.NewRestoreOptions()
-	opt.OutputPath = p.cfg.DBPath
+	opt.OutputPath = tmpPath
 
 	updatedAt, err := replica.CalcRestoreTarget(ctx, opt)
 	if err != nil {
+		// Check if this is a "no snapshots" situation - not an error for passive.
+		if isPassiveNoSnapshotsError(err) {
+			p.logger.Debug("no snapshots available yet for catch-up")
+			return nil
+		}
 		return fmt.Errorf("calc restore target: %w", err)
 	}
 
+	// If updatedAt is zero, there's nothing to restore yet.
+	if updatedAt.IsZero() {
+		p.logger.Debug("no restore target available yet")
+		return nil
+	}
+
 	if err := replica.Restore(ctx, opt); err != nil {
+		// Clean up failed temp file.
+		_ = os.Remove(tmpPath)
+		_ = os.Remove(tmpPath + "-wal")
+		_ = os.Remove(tmpPath + "-shm")
+		
+		// Check for no snapshots error during restore.
+		if isPassiveNoSnapshotsError(err) || errors.Is(err, litestream.ErrNoSnapshots) {
+			p.logger.Debug("no snapshots available for restore")
+			return nil
+		}
 		return fmt.Errorf("restore from replica: %w", err)
+	}
+
+	// Ensure output directory exists.
+	outputDir := filepath.Dir(p.cfg.DBPath)
+	if err := os.MkdirAll(outputDir, 0755); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("create output directory: %w", err)
+	}
+
+	// Remove existing database files before moving the new one into place.
+	// This is safe because the passive node doesn't serve traffic.
+	_ = os.Remove(p.cfg.DBPath + "-wal")
+	_ = os.Remove(p.cfg.DBPath + "-shm")
+	_ = os.Remove(p.cfg.DBPath)
+
+	// Atomically move the temp file into place.
+	if err := os.Rename(tmpPath, p.cfg.DBPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("rename temp db to final path: %w", err)
 	}
 
 	p.mu.Lock()
@@ -168,6 +232,8 @@ func (p *Passive) CatchUp(ctx context.Context) error {
 // A lag of zero indicates that the last restore was performed at the
 // most recent available point in the replica. If no restore has been
 // performed yet, the lag is reported as zero.
+//
+// If the replica has no data yet (e.g., new cluster), returns zero with no error.
 func (p *Passive) ReplicationLag(ctx context.Context) (time.Duration, error) {
 	p.mu.Lock()
 	replica := p.replica
@@ -182,7 +248,16 @@ func (p *Passive) ReplicationLag(ctx context.Context) (time.Duration, error) {
 	opt := litestream.NewRestoreOptions()
 	updatedAt, err := replica.CalcRestoreTarget(ctx, opt)
 	if err != nil {
+		// If no snapshots available, report zero lag (nothing to catch up to).
+		if isPassiveNoSnapshotsError(err) {
+			return 0, nil
+		}
 		return 0, fmt.Errorf("calc restore target: %w", err)
+	}
+
+	// If no data available yet, report zero lag.
+	if updatedAt.IsZero() {
+		return 0, nil
 	}
 
 	if last.IsZero() {
@@ -193,4 +268,25 @@ func (p *Passive) ReplicationLag(ctx context.Context) (time.Duration, error) {
 	}
 
 	return updatedAt.Sub(last), nil
+}
+
+// isPassiveNoSnapshotsError checks if the error indicates no snapshots are available.
+// This is a local helper since the passive replicator needs to handle this case gracefully.
+func isPassiveNoSnapshotsError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Litestream returns various errors when no snapshots exist.
+	// Check for common patterns.
+	errStr := err.Error()
+	if errors.Is(err, litestream.ErrNoSnapshots) {
+		return true
+	}
+	noSnapshotPatterns := []string{"no snapshots", "no generations", "bucket not found", "key not found", "no matching backup"}
+	for _, pattern := range noSnapshotPatterns {
+		if strings.Contains(strings.ToLower(errStr), pattern) {
+			return true
+		}
+	}
+	return false
 }

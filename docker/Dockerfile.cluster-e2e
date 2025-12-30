@@ -1,0 +1,58 @@
+# Dockerfile for Convex Cluster Manager E2E Testing
+# This image provides a systemd-enabled Ubuntu container for testing
+# the cluster manager with real Convex backends.
+
+FROM ubuntu:24.04
+
+# Install required packages including Node.js for Convex CLI
+RUN DEBIAN_FRONTEND=noninteractive apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        systemd \
+        systemd-sysv \
+        systemd-resolved \
+        iproute2 \
+        iputils-ping \
+        iputils-arping \
+        curl \
+        ca-certificates \
+        sqlite3 \
+        jq \
+        netcat-openbsd \
+        gnupg \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* \
+    # Install Node.js 20.x for Convex CLI (if needed for debugging)
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y nodejs \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Configure systemd for container environment (remove unnecessary services)
+RUN cd /lib/systemd/system/sysinit.target.wants/ && \
+    ls | grep -v systemd-tmpfiles-setup | xargs rm -f && \
+    rm -f /lib/systemd/system/multi-user.target.wants/* && \
+    rm -f /etc/systemd/system/*.wants/* && \
+    rm -f /lib/systemd/system/local-fs.target.wants/* && \
+    rm -f /lib/systemd/system/sockets.target.wants/*udev* && \
+    rm -f /lib/systemd/system/sockets.target.wants/*initctl* && \
+    rm -f /lib/systemd/system/basic.target.wants/* && \
+    rm -f /lib/systemd/system/anaconda.target.wants/* || true
+
+# Mask services that might cause issues in containers
+RUN systemctl mask auditd.service 2>/dev/null || true
+
+# Create directories for Convex
+RUN mkdir -p /var/lib/convex/data /var/lib/convex/data/storage /var/lib/convex/replica /etc/convex
+
+# Create convex-backend systemd service template
+# NOTE: The E2E test script will override this with proper instance parameters
+RUN printf '[Unit]\nDescription=Convex Backend Service\nAfter=network.target\n\n[Service]\nType=simple\nExecStart=/usr/local/bin/convex-backend\nRestart=always\nRestartSec=5\nEnvironmentFile=-/etc/convex/convex.env\n\n[Install]\nWantedBy=multi-user.target\n' > /etc/systemd/system/convex-backend.service
+
+# Create convex-cluster-manager systemd service template
+RUN printf '[Unit]\nDescription=Convex Cluster Manager\nAfter=network.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStart=/usr/local/bin/convex-cluster-manager daemon\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n' > /etc/systemd/system/convex-cluster-manager.service
+
+# Volume for cgroups
+VOLUME [ "/sys/fs/cgroup" ]
+
+# Use systemd as init
+CMD ["/lib/systemd/systemd"]

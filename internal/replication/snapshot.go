@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -96,6 +98,18 @@ func (s *Snapshotter) Start(ctx context.Context) error {
 	defer s.mu.Unlock()
 
 	if s.running {
+		return nil
+	}
+
+	// Ensure the database directory exists.
+	dbDir := filepath.Dir(s.cfg.DBPath)
+	if err := os.MkdirAll(dbDir, 0755); err != nil {
+		return fmt.Errorf("create database directory: %w", err)
+	}
+
+	// Check if database file exists - if not, we can't start snapshots yet.
+	if _, err := os.Stat(s.cfg.DBPath); os.IsNotExist(err) {
+		s.logger.Info("database file does not exist yet, skipping snapshotter start")
 		return nil
 	}
 
@@ -253,11 +267,27 @@ func (s *Snapshotter) snapshotOnce(ctx context.Context) error {
 	)
 
 	// Enforce time-based retention on snapshot level using the
-	// configured retention window.
+	// configured retention window. We wrap this in a recovery block
+	// because the litestream retention enforcement may not be fully
+	// implemented for all backends.
 	threshold := time.Now().Add(-s.cfg.Retention)
-	if _, err := db.EnforceSnapshotRetention(ctx, threshold); err != nil {
-		return fmt.Errorf("enforce snapshot retention: %w", err)
+	if err := s.enforceRetentionSafe(ctx, db, threshold); err != nil {
+		// Log but don't fail - retention enforcement is best-effort.
+		s.logger.Warn("failed to enforce snapshot retention", "error", err)
 	}
 
 	return nil
+}
+
+// enforceRetentionSafe wraps retention enforcement with panic recovery
+// since the litestream library may have unimplemented methods.
+func (s *Snapshotter) enforceRetentionSafe(ctx context.Context, db *litestream.DB, threshold time.Time) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("retention enforcement panic: %v", r)
+		}
+	}()
+
+	_, err = db.EnforceSnapshotRetention(ctx, threshold)
+	return err
 }

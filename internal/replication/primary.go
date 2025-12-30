@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -105,6 +107,18 @@ func (p *Primary) Start(ctx context.Context) error {
 	defer p.mu.Unlock()
 
 	if p.running {
+		return nil
+	}
+
+	// Ensure the database directory exists.
+	dbDir := filepath.Dir(p.cfg.DBPath)
+	if err := os.MkdirAll(dbDir, 0755); err != nil {
+		return fmt.Errorf("create database directory: %w", err)
+	}
+
+	// Check if database file exists - if not, we can't start replication yet.
+	if _, err := os.Stat(p.cfg.DBPath); os.IsNotExist(err) {
+		p.logger.Info("database file does not exist yet, skipping primary replication start")
 		return nil
 	}
 

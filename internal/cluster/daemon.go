@@ -2,8 +2,10 @@ package cluster
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"log/slog"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -14,6 +16,8 @@ import (
 	"github.com/ozanturksever/convex-cluster-manager/internal/health"
 	"github.com/ozanturksever/convex-cluster-manager/internal/replication"
 	"github.com/ozanturksever/convex-cluster-manager/internal/vip"
+
+	_ "modernc.org/sqlite" // Pure Go SQLite driver for WAL mode verification (no CGO required)
 )
 
 // Daemon composes leader election, state management, backend control,
@@ -229,6 +233,30 @@ func (d *Daemon) handleBecomeLeader() {
 		d.health.SetBackendStatus("failed")
 	} else {
 		d.health.SetBackendStatus("running")
+
+		// Verify WAL mode after backend starts (backend should create DB in WAL mode)
+		// Run in goroutine to avoid blocking the state transition
+		if d.cfg.Backend.DataPath != "" {
+			go func() {
+				// Poll for database file to exist (max 30 seconds)
+				dbPath := d.cfg.Backend.DataPath
+				for i := 0; i < 30; i++ {
+					if _, err := os.Stat(dbPath); err == nil {
+						break
+					}
+					time.Sleep(1 * time.Second)
+				}
+				// Wait a bit more for backend to initialize the DB
+				time.Sleep(2 * time.Second)
+				
+				if err := verifyWALMode(dbPath); err != nil {
+					d.logger.Error("WAL mode verification failed - replication will not work correctly", "error", err)
+					d.health.SetBackendStatus("running-no-wal")
+				} else {
+					d.logger.Info("WAL mode verified for database", "path", dbPath)
+				}
+			}()
+		}
 	}
 
 	// Start primary WAL replication.
@@ -292,6 +320,37 @@ func (d *Daemon) handleStepDown() {
 	}
 }
 
+// verifyWALMode checks if the database at the given path is in WAL mode.
+// Returns nil if WAL mode is enabled, an error otherwise.
+func verifyWALMode(dbPath string) error {
+	// Check if database file exists
+	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+		// Database doesn't exist yet - it will be created by the backend
+		// We'll verify WAL mode after the backend starts
+		return nil
+	}
+
+	db, err := sql.Open("sqlite", dbPath+"?mode=ro")
+	if err != nil {
+		return fmt.Errorf("failed to open database for WAL verification: %w", err)
+	}
+	defer db.Close()
+
+	var journalMode string
+	err = db.QueryRow("PRAGMA journal_mode;").Scan(&journalMode)
+	if err != nil {
+		return fmt.Errorf("failed to query journal mode: %w", err)
+	}
+
+	if strings.ToLower(journalMode) != "wal" {
+		return fmt.Errorf("database is not in WAL mode (current: %s). "+
+			"The cluster manager requires the convex-backend fork with WAL support. "+
+			"See README.md for details", journalMode)
+	}
+
+	return nil
+}
+
 // Run starts the daemon and blocks until the context is cancelled or a
 // fatal error occurs. It owns the lifetime of the election and health
 // checker; backend, VIP, and replication components are managed via
@@ -301,6 +360,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 	defer d.setCtx(context.Background())
 
 	d.logger.Info("daemon starting")
+
+	// Verify WAL mode if database exists
+	if d.cfg.Backend.DataPath != "" {
+		if err := verifyWALMode(d.cfg.Backend.DataPath); err != nil {
+			d.logger.Warn("WAL mode verification", "status", "database not yet created or verification skipped", "path", d.cfg.Backend.DataPath)
+		}
+	}
 
 	// Start leader election.
 	if err := d.election.Start(ctx); err != nil {

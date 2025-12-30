@@ -124,9 +124,33 @@ The cluster manager implements an active-passive clustering pattern:
 
 ## Requirements
 
+- **Convex Backend Fork with WAL Support**: The cluster manager requires a custom fork of `convex-local-backend` that enables SQLite WAL (Write-Ahead Logging) mode. The official Convex backend uses SQLite's default DELETE journal mode, which is not compatible with Litestream-based WAL replication.
+  
+  The required fork is available at: `convex-backend/` in this repository.
+  
+  To build:
+  ```bash
+  cd convex-backend
+  cargo build --release -p local_backend
+  # Binaries will be at:
+  # - target/release/convex-local-backend-linux-amd64
+  # - target/release/convex-local-backend-linux-arm64
+  ```
+
 - NATS server with JetStream enabled
 - Linux (for VIP management via iproute2)
 - systemd (for backend service control)
+
+### Why a Custom Fork?
+
+The cluster manager uses Litestream to replicate SQLite WAL (Write-Ahead Log) changes between nodes. This requires the backend to run in WAL mode (`PRAGMA journal_mode=WAL`). The official Convex backend does not enable WAL mode, so we use a fork that adds this capability.
+
+Key changes in the fork (`convex-backend/crates/sqlite/src/lib.rs`):
+```rust
+// Enable WAL mode for replication support
+connection.execute_batch("PRAGMA journal_mode=WAL;")?;
+connection.execute_batch("PRAGMA synchronous=NORMAL;")?;
+```
 
 ## License
 
