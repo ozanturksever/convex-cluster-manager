@@ -2,7 +2,7 @@ module github.com/ozanturksever/convex-cluster-manager
 
 go 1.24.1
 
-replace github.com/benbjohnson/litestream => ../litestream
+replace github.com/benbjohnson/litestream => github.com/ozanturksever/litestream v0.6.0
 
 require (
 	github.com/benbjohnson/litestream v0.5.5
@@ -10,6 +10,7 @@ require (
 	github.com/nats-io/nats.go v1.48.0
 	github.com/spf13/cobra v1.10.2
 	github.com/stretchr/testify v1.11.1
+	github.com/superfly/ltx v0.5.1
 	github.com/testcontainers/testcontainers-go v0.34.0
 	modernc.org/sqlite v1.42.2
 )
@@ -74,7 +75,6 @@ require (
 	github.com/shoenig/go-m1cpu v0.1.6 // indirect
 	github.com/sirupsen/logrus v1.9.3 // indirect
 	github.com/spf13/pflag v1.0.9 // indirect
-	github.com/superfly/ltx v0.5.1 // indirect
 	github.com/tetratelabs/wazero v1.2.1 // indirect
 	github.com/tklauser/go-sysconf v0.3.12 // indirect
 	github.com/tklauser/numcpus v0.6.1 // indirect
