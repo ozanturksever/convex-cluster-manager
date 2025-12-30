@@ -2,10 +2,8 @@ module github.com/ozanturksever/convex-cluster-manager
 
 go 1.24.1
 
-replace github.com/benbjohnson/litestream => ../litestream
-
 require (
-	github.com/benbjohnson/litestream v0.0.0-00010101000000-000000000000
+	github.com/benbjohnson/litestream v0.5.5
 	github.com/docker/docker v27.1.1+incompatible
 	github.com/nats-io/nats.go v1.48.0
 	github.com/spf13/cobra v1.10.2
