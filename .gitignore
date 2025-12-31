@@ -11,3 +11,11 @@ devenv.local.nix
 # GoReleaser
 dist/
 .codebuff
+
+# Test output directories
+test-cluster-e2e-output/
+
+# Build outputs
+bin/
+coverage.out
+coverage.html
