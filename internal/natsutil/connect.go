@@ -13,6 +13,24 @@ type ConnectOptions struct {
 	URLs        []string
 	Credentials string
 	Logger      *slog.Logger
+
+	// Optional callbacks for connection state changes.
+	// These are called in addition to the default logging handlers.
+
+	// OnReconnect is called when the connection is re-established after a disconnect.
+	// The callback receives the NATS connection and the URL of the server connected to.
+	OnReconnect func(nc *nats.Conn, url string)
+
+	// OnDisconnect is called when the connection is lost.
+	// The callback receives the NATS connection and the error that caused the disconnect (may be nil).
+	OnDisconnect func(nc *nats.Conn, err error)
+
+	// OnDiscovered is called when new servers are discovered via cluster gossip.
+	// The callback receives the NATS connection and the list of newly discovered server URLs.
+	OnDiscovered func(nc *nats.Conn, servers []string)
+
+	// OnClosed is called when the connection is permanently closed.
+	OnClosed func(nc *nats.Conn)
 }
 
 // Connect creates a NATS connection with automatic failover and cluster discovery.
@@ -45,14 +63,23 @@ func Connect(opts ConnectOptions) (*nats.Conn, error) {
 				"discovered", servers,
 				"all_known", known,
 			)
+			// Call user callback if provided
+			if opts.OnDiscovered != nil {
+				opts.OnDiscovered(nc, servers)
+			}
 		}),
 
 		// Handler called on successful reconnection.
 		nats.ReconnectHandler(func(nc *nats.Conn) {
+			url := nc.ConnectedUrl()
 			logger.Info("NATS reconnected",
-				"url", nc.ConnectedUrl(),
+				"url", url,
 				"server_id", nc.ConnectedServerId(),
 			)
+			// Call user callback if provided
+			if opts.OnReconnect != nil {
+				opts.OnReconnect(nc, url)
+			}
 		}),
 
 		// Handler called when connection is lost.
@@ -62,11 +89,19 @@ func Connect(opts ConnectOptions) (*nats.Conn, error) {
 			} else {
 				logger.Debug("NATS disconnected gracefully")
 			}
+			// Call user callback if provided
+			if opts.OnDisconnect != nil {
+				opts.OnDisconnect(nc, err)
+			}
 		}),
 
 		// Handler called when connection is permanently closed.
 		nats.ClosedHandler(func(nc *nats.Conn) {
 			logger.Info("NATS connection closed")
+			// Call user callback if provided
+			if opts.OnClosed != nil {
+				opts.OnClosed(nc)
+			}
 		}),
 
 		// Handler for async errors (e.g., slow consumer).

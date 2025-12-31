@@ -16,7 +16,6 @@ import (
 
 	"github.com/ozanturksever/convex-cluster-manager/internal/cluster"
 	"github.com/ozanturksever/convex-cluster-manager/internal/config"
-	"github.com/ozanturksever/convex-cluster-manager/internal/health"
 	"github.com/ozanturksever/convex-cluster-manager/internal/replication"
 )
 
@@ -370,25 +369,26 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Println()
 
-	// Try to query the running daemon via NATS health checker first.
+	// Try to query the running daemon via nats.micro service.
 	// This gives us the actual daemon state without interfering with elections.
-	healthCfg := health.Config{
-		ClusterID: cfg.ClusterID,
-		NodeID:    cfg.NodeID + "-status-query", // Use different node ID to not interfere
-		NATSURLs:  cfg.NATS.Servers,
+	svcCfg := cluster.ServiceConfig{
+		ClusterID:       cfg.ClusterID,
+		NodeID:          cfg.NodeID + "-status-query", // Use different node ID to not interfere
+		NATSURLs:        cfg.NATS.Servers,
+		NATSCredentials: cfg.NATS.Credentials,
 	}
-	checker, err := health.NewChecker(healthCfg)
+	svc, err := cluster.NewService(svcCfg)
 	if err != nil {
-		return fmt.Errorf("failed to create health checker: %w", err)
+		return fmt.Errorf("failed to create service: %w", err)
 	}
 
-	if err := checker.Start(ctx); err != nil {
-		return fmt.Errorf("failed to start health checker: %w", err)
+	if err := svc.Start(ctx); err != nil {
+		return fmt.Errorf("failed to start service: %w", err)
 	}
-	defer checker.Stop()
+	defer svc.Stop()
 
-	// Query this node's daemon health status
-	resp, err := checker.QueryNode(ctx, cfg.NodeID, 5*time.Second)
+	// Query this node's daemon status
+	resp, err := svc.QueryNodeStatus(ctx, cfg.NodeID, 5*time.Second)
 	if err != nil {
 		// If we can't reach the daemon, fall back to just showing the leader from KV
 		fmt.Printf("Role:        UNKNOWN (daemon not responding)\n")

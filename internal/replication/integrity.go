@@ -6,10 +6,8 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"strings"
 
 	"github.com/benbjohnson/litestream"
-	litestreamnats "github.com/benbjohnson/litestream/nats"
 	"github.com/superfly/ltx"
 )
 
@@ -156,13 +154,13 @@ func (ic *IntegrityChecker) checkReplica(ctx context.Context, report *IntegrityR
 	}
 
 	// Configure NATS replica client with all URLs for automatic failover.
-	client := litestreamnats.NewReplicaClient()
-	client.URL = strings.Join(ic.cfg.NATSURLs, ",")
-	client.BucketName = fmt.Sprintf("convex-%s-wal", ic.cfg.ClusterID)
-	client.Path = ic.cfg.ReplicaPath
-	if ic.cfg.NATSCredentials != "" {
-		client.Creds = ic.cfg.NATSCredentials
-	}
+	client := NewReplicaClient(ReplicaClientConfig{
+		NATSURLs:        ic.cfg.NATSURLs,
+		NATSCredentials: ic.cfg.NATSCredentials,
+		BucketName:      BucketNameForCluster(ic.cfg.ClusterID),
+		Path:            ic.cfg.ReplicaPath,
+		Logger:          ic.logger,
+	})
 	defer client.Close()
 
 	if err := client.Init(ctx); err != nil {
@@ -196,13 +194,13 @@ func (ic *IntegrityChecker) ValidateLTXFile(ctx context.Context, level int, minT
 	}
 
 	// Configure NATS replica client with all URLs for automatic failover.
-	client := litestreamnats.NewReplicaClient()
-	client.URL = strings.Join(ic.cfg.NATSURLs, ",")
-	client.BucketName = fmt.Sprintf("convex-%s-wal", ic.cfg.ClusterID)
-	client.Path = ic.cfg.ReplicaPath
-	if ic.cfg.NATSCredentials != "" {
-		client.Creds = ic.cfg.NATSCredentials
-	}
+	client := NewReplicaClient(ReplicaClientConfig{
+		NATSURLs:        ic.cfg.NATSURLs,
+		NATSCredentials: ic.cfg.NATSCredentials,
+		BucketName:      BucketNameForCluster(ic.cfg.ClusterID),
+		Path:            ic.cfg.ReplicaPath,
+		Logger:          ic.logger,
+	})
 	defer client.Close()
 
 	if err := client.Init(ctx); err != nil {
@@ -238,13 +236,13 @@ func (ic *IntegrityChecker) ValidateAllLTXFiles(ctx context.Context) (validated 
 	}
 
 	// Configure NATS replica client with all URLs for automatic failover.
-	client := litestreamnats.NewReplicaClient()
-	client.URL = strings.Join(ic.cfg.NATSURLs, ",")
-	client.BucketName = fmt.Sprintf("convex-%s-wal", ic.cfg.ClusterID)
-	client.Path = ic.cfg.ReplicaPath
-	if ic.cfg.NATSCredentials != "" {
-		client.Creds = ic.cfg.NATSCredentials
-	}
+	client := NewReplicaClient(ReplicaClientConfig{
+		NATSURLs:        ic.cfg.NATSURLs,
+		NATSCredentials: ic.cfg.NATSCredentials,
+		BucketName:      BucketNameForCluster(ic.cfg.ClusterID),
+		Path:            ic.cfg.ReplicaPath,
+		Logger:          ic.logger,
+	})
 	defer client.Close()
 
 	if err := client.Init(ctx); err != nil {
@@ -314,13 +312,13 @@ func (ic *IntegrityChecker) CompareWithReplica(ctx context.Context) (localTXID, 
 	}
 
 	// Configure NATS replica client with all URLs for automatic failover.
-	client := litestreamnats.NewReplicaClient()
-	client.URL = strings.Join(ic.cfg.NATSURLs, ",")
-	client.BucketName = fmt.Sprintf("convex-%s-wal", ic.cfg.ClusterID)
-	client.Path = ic.cfg.ReplicaPath
-	if ic.cfg.NATSCredentials != "" {
-		client.Creds = ic.cfg.NATSCredentials
-	}
+	client := NewReplicaClient(ReplicaClientConfig{
+		NATSURLs:        ic.cfg.NATSURLs,
+		NATSCredentials: ic.cfg.NATSCredentials,
+		BucketName:      BucketNameForCluster(ic.cfg.ClusterID),
+		Path:            ic.cfg.ReplicaPath,
+		Logger:          ic.logger,
+	})
 	defer client.Close()
 
 	if err := client.Init(ctx); err != nil {

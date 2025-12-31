@@ -189,8 +189,8 @@ github.com/opencontainers/go-digest v1.0.0 h1:apOUWs51W5PlhuyGyz9FCeeBIOUDA/6nW8
 github.com/opencontainers/go-digest v1.0.0/go.mod h1:0JzlMkj0TRzQZfJkVvzbP0HBR3IKzErnv2BNG4W4MAM=
 github.com/opencontainers/image-spec v1.1.0 h1:8SG7/vwALn54lVB/0yZ/MMwhFrPYtpEHQb2IpWsCzug=
 github.com/opencontainers/image-spec v1.1.0/go.mod h1:W4s4sFTMaBeK1BQLXbG4AdM2szdn85PY75RI83NrTrM=
-github.com/ozanturksever/litestream v0.6.0 h1:NEMZvYgYmicPbAN/BH8oXCIpibuPB7ebp6sdvgwZ+n0=
-github.com/ozanturksever/litestream v0.6.0/go.mod h1:NVOjAELZTl+MqGjWKHpWoy6Al1LGL+7yM4qI8sptLyk=
+github.com/ozanturksever/litestream v0.6.1-0.20251231164304-3026a106af74 h1:sVg6jbqjW+w1gtCfO05lfCYNK8GB0eWC3UNlgptK6w4=
+github.com/ozanturksever/litestream v0.6.1-0.20251231164304-3026a106af74/go.mod h1:NVOjAELZTl+MqGjWKHpWoy6Al1LGL+7yM4qI8sptLyk=
 github.com/pierrec/lz4/v4 v4.1.22 h1:cKFw6uJDK+/gfw5BcDL0JL5aBsAFdsIT18eRtLj7VIU=
 github.com/pierrec/lz4/v4 v4.1.22/go.mod h1:gZWDp/Ze/IJXGXf23ltt2EXimqmTUXEy0GFuRQyBid4=
 github.com/pkg/browser v0.0.0-20240102092130-5ac0b6a4141c h1:+mdjkGKdHQG3305AYmdv1U2eRNDiU2ErMBj1gwrq8eQ=

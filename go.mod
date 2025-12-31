@@ -2,7 +2,7 @@ module github.com/ozanturksever/convex-cluster-manager
 
 go 1.24.1
 
-replace github.com/benbjohnson/litestream => github.com/ozanturksever/litestream v0.6.0
+replace github.com/benbjohnson/litestream => github.com/ozanturksever/litestream v0.6.1-0.20251231164304-3026a106af74
 
 require (
 	github.com/benbjohnson/litestream v0.5.5

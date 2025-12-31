@@ -15,6 +15,11 @@ import (
 	"github.com/ozanturksever/convex-cluster-manager/internal/natsutil"
 )
 
+// Election errors
+var (
+	ErrElectionClosed = errors.New("election closed")
+)
+
 // ElectionConfig contains configuration for leader election.
 type ElectionConfig struct {
 	ClusterID         string
@@ -25,7 +30,16 @@ type ElectionConfig struct {
 	HeartbeatInterval time.Duration
 }
 
-// Election manages leader election using NATS KV store.
+// BucketName returns the auth-compatible KV bucket name for election.
+// Format: convex-<cluster_id>-election
+// This allows NATS auth rules like: $KV.convex-mycluster-election.>
+func (c ElectionConfig) BucketName() string {
+	return fmt.Sprintf("convex-%s-election", c.ClusterID)
+}
+
+// Election manages leader election using NATS KV store with watchers.
+// It uses KV TTL for lease-based leadership and KV watchers for
+// real-time leader change detection instead of polling.
 type Election struct {
 	cfg    ElectionConfig
 	nc     *nats.Conn
@@ -38,13 +52,17 @@ type Election struct {
 	currentLeader string
 	revision      uint64
 
-	// renewFailures tracks consecutive renewal failures to implement graceful degradation.
-	// We only step down after multiple consecutive failures to handle transient NATS issues.
+	// renewFailures tracks consecutive renewal failures for graceful degradation
 	renewFailures int
 
-	leaderCh chan struct{}
-	stopCh   chan struct{}
-	wg       sync.WaitGroup
+	// Channels for coordination
+	leaderCh chan struct{} // Notifies when this node becomes leader
+	stopCh   chan struct{} // Signals shutdown
+
+	// Watcher for real-time leader changes
+	watcher jetstream.KeyWatcher
+
+	wg sync.WaitGroup
 }
 
 // NewElection creates a new Election instance.
@@ -69,13 +87,15 @@ func NewElection(cfg ElectionConfig) (*Election, error) {
 
 	return &Election{
 		cfg:      cfg,
-		logger:   slog.Default().With("component", "election", "node", cfg.NodeID),
+		logger:   slog.Default().With("component", "election", "node", cfg.NodeID, "cluster", cfg.ClusterID),
 		leaderCh: make(chan struct{}, 1),
 		stopCh:   make(chan struct{}),
 	}, nil
 }
 
 // Start begins the election process.
+// It connects to NATS, creates/gets the KV bucket, starts the KV watcher,
+// and attempts to acquire leadership.
 func (e *Election) Start(ctx context.Context) error {
 	// Reset stop channel for restart capability
 	e.stopCh = make(chan struct{})
@@ -87,7 +107,7 @@ func (e *Election) Start(ctx context.Context) error {
 		Logger:      e.logger,
 	})
 	if err != nil {
-		return fmt.Errorf("failed to connect to NATS: %w", err)
+		return fmt.Errorf("connect to NATS: %w", err)
 	}
 	e.nc = nc
 
@@ -95,12 +115,13 @@ func (e *Election) Start(ctx context.Context) error {
 	js, err := jetstream.New(nc)
 	if err != nil {
 		nc.Close()
-		return fmt.Errorf("failed to create JetStream context: %w", err)
+		return fmt.Errorf("create JetStream context: %w", err)
 	}
 	e.js = js
 
 	// Create or get KV bucket for leader election
-	bucketName := fmt.Sprintf("cluster-%s-election", e.cfg.ClusterID)
+	// Using auth-compatible bucket name: convex-<cluster_id>-election
+	bucketName := e.cfg.BucketName()
 	kv, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
 		Bucket: bucketName,
 		TTL:    e.cfg.LeaderTTL,
@@ -110,35 +131,60 @@ func (e *Election) Start(ctx context.Context) error {
 		kv, err = js.KeyValue(ctx, bucketName)
 		if err != nil {
 			nc.Close()
-			return fmt.Errorf("failed to create/get KV bucket: %w", err)
+			return fmt.Errorf("create/get KV bucket %s: %w", bucketName, err)
 		}
 	}
 	e.kv = kv
 
-	// Clear any stale cooldown for this node on startup.
-	// A fresh daemon start indicates a new session - old cooldowns are no longer relevant.
-	// This prevents cross-contamination between daemon restarts and test runs.
-	cooldownKey := fmt.Sprintf("cooldown-%s", e.cfg.NodeID)
+	// Clear any stale cooldown for this node on startup
+	cooldownKey := e.cooldownKey()
 	_ = kv.Delete(ctx, cooldownKey)
+
+	// Start KV watcher for real-time leader change detection
+	watcher, err := kv.Watch(ctx, "leader")
+	if err != nil {
+		nc.Close()
+		return fmt.Errorf("create leader watcher: %w", err)
+	}
+	e.watcher = watcher
 
 	// Try to acquire leadership immediately
 	e.tryAcquireOrRenew(ctx)
 
-	// Start election loop
-	e.wg.Add(1)
-	go e.electionLoop(ctx)
+	// Start background goroutines
+	e.wg.Add(2)
+	go e.watchLoop(ctx)
+	go e.heartbeatLoop(ctx)
 
+	e.logger.Info("election started", "bucket", bucketName)
 	return nil
 }
 
-// Stop stops the election process.
+// Stop stops the election process and releases leadership if held.
 func (e *Election) Stop() {
 	close(e.stopCh)
 	e.wg.Wait()
 
+	// Clean up watcher
+	if e.watcher != nil {
+		_ = e.watcher.Stop()
+		e.watcher = nil
+	}
+
+	// Clean up leadership if we're the leader
+	e.mu.Lock()
+	if e.isLeader && e.kv != nil {
+		_ = e.kv.Delete(context.Background(), "leader")
+		e.isLeader = false
+	}
+	e.mu.Unlock()
+
 	if e.nc != nil {
 		e.nc.Close()
+		e.nc = nil
 	}
+
+	e.logger.Info("election stopped")
 }
 
 // IsLeader returns true if this node is the current leader.
@@ -161,46 +207,33 @@ func (e *Election) LeaderCh() <-chan struct{} {
 }
 
 // StepDown voluntarily gives up leadership.
-// It sets a cooldown marker in KV to prevent this node from immediately
-// re-acquiring leadership, allowing other nodes to take over.
-//
-// This method can be called from:
-// 1. The daemon's Election instance (where isLeader is true)
-// 2. A CLI command's Election instance (where isLeader is false, but we still
-//    need to delete the leader key and set cooldown)
-//
-// In both cases, we proceed with deleting the leader key and setting cooldown.
+// It sets a cooldown marker to prevent immediate re-acquisition,
+// allowing other nodes to take over.
 func (e *Election) StepDown(ctx context.Context) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	// Set a cooldown marker BEFORE deleting the leader key.
-	// This prevents this node from immediately re-acquiring leadership.
-	// The cooldown duration equals the leader TTL, which is sufficient time
-	// for other nodes to detect the missing leader and acquire leadership.
-	// Note: The cooldown key will be auto-removed by the KV bucket's TTL.
+	// Set cooldown marker BEFORE deleting leader key
 	cooldownDuration := e.cfg.LeaderTTL
 	cooldownExpiry := time.Now().Add(cooldownDuration).UnixMilli()
-	cooldownKey := fmt.Sprintf("cooldown-%s", e.cfg.NodeID)
-	
-	// Store cooldown with TTL so it auto-expires
+	cooldownKey := e.cooldownKey()
+
+	// Store cooldown (will be auto-removed by KV TTL)
 	_, err := e.kv.Create(ctx, cooldownKey, []byte(strconv.FormatInt(cooldownExpiry, 10)))
 	if err != nil {
-		// If key already exists, update it
+		// If key exists, update it
 		_, err = e.kv.Put(ctx, cooldownKey, []byte(strconv.FormatInt(cooldownExpiry, 10)))
 		if err != nil {
 			e.logger.Warn("failed to set cooldown marker", "error", err)
-			// Continue with step down anyway
 		}
 	}
 
 	// Delete the leader key
-	err = e.kv.Delete(ctx, "leader")
-	if err != nil && !errors.Is(err, jetstream.ErrKeyNotFound) {
-		return fmt.Errorf("failed to delete leader key: %w", err)
+	if err := e.kv.Delete(ctx, "leader"); err != nil && !errors.Is(err, jetstream.ErrKeyNotFound) {
+		return fmt.Errorf("delete leader key: %w", err)
 	}
 
-	// Update local state (may already be false if called from CLI)
+	// Update local state
 	e.isLeader = false
 	e.currentLeader = ""
 	e.revision = 0
@@ -209,7 +242,88 @@ func (e *Election) StepDown(ctx context.Context) error {
 	return nil
 }
 
-func (e *Election) electionLoop(ctx context.Context) {
+// cooldownKey returns the KV key for this node's cooldown marker.
+func (e *Election) cooldownKey() string {
+	return fmt.Sprintf("cooldown-%s", e.cfg.NodeID)
+}
+
+// watchLoop watches for leader changes via KV watcher.
+// This provides real-time notification when the leader changes,
+// eliminating the need for polling.
+func (e *Election) watchLoop(ctx context.Context) {
+	defer e.wg.Done()
+
+	for {
+		select {
+		case <-e.stopCh:
+			return
+		case entry := <-e.watcher.Updates():
+			if entry == nil {
+				// Watcher closed or initial nil
+				continue
+			}
+			e.handleLeaderUpdate(ctx, entry)
+		}
+	}
+}
+
+// handleLeaderUpdate processes a leader key update from the watcher.
+func (e *Election) handleLeaderUpdate(ctx context.Context, entry jetstream.KeyValueEntry) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	operation := entry.Operation()
+
+	switch operation {
+	case jetstream.KeyValuePut:
+		// Leader key was set or updated
+		newLeader := string(entry.Value())
+		oldLeader := e.currentLeader
+		e.currentLeader = newLeader
+		e.revision = entry.Revision()
+
+		if newLeader == e.cfg.NodeID {
+			// We are the leader
+			if !e.isLeader {
+				e.isLeader = true
+				e.logger.Info("became leader via watch", "revision", entry.Revision())
+				// Notify via channel (non-blocking)
+				select {
+				case e.leaderCh <- struct{}{}:
+				default:
+				}
+			}
+		} else {
+			// Someone else is the leader
+			if e.isLeader {
+				e.logger.Warn("lost leadership to another node", "new_leader", newLeader)
+				e.isLeader = false
+			}
+			if oldLeader != newLeader {
+				e.logger.Info("leader changed", "old", oldLeader, "new", newLeader)
+			}
+		}
+
+	case jetstream.KeyValueDelete, jetstream.KeyValuePurge:
+		// Leader key was deleted (TTL expired or explicit delete)
+		if e.currentLeader != "" {
+			e.logger.Info("leader key deleted", "previous_leader", e.currentLeader)
+		}
+		e.currentLeader = ""
+		e.revision = 0
+
+		// If we were the leader and key was deleted externally, update state
+		if e.isLeader {
+			e.logger.Warn("leadership lost - key deleted")
+			e.isLeader = false
+		}
+
+		// Try to acquire leadership (will be done in next heartbeat to avoid race)
+	}
+}
+
+// heartbeatLoop periodically renews leadership or attempts acquisition.
+func (e *Election) heartbeatLoop(ctx context.Context) {
 	defer e.wg.Done()
 
 	ticker := time.NewTicker(e.cfg.HeartbeatInterval)
@@ -218,13 +332,6 @@ func (e *Election) electionLoop(ctx context.Context) {
 	for {
 		select {
 		case <-e.stopCh:
-			// Clean up leadership if we're the leader
-			e.mu.Lock()
-			if e.isLeader {
-				_ = e.kv.Delete(context.Background(), "leader")
-				e.isLeader = false
-			}
-			e.mu.Unlock()
 			return
 		case <-ticker.C:
 			e.tryAcquireOrRenew(ctx)
@@ -232,48 +339,37 @@ func (e *Election) electionLoop(ctx context.Context) {
 	}
 }
 
+// tryAcquireOrRenew attempts to acquire or renew leadership.
 func (e *Election) tryAcquireOrRenew(ctx context.Context) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
 	if e.isLeader {
-		// Try to renew leadership
 		e.renewLeadership(ctx)
 	} else {
-		// Try to acquire leadership
 		e.tryAcquireLeadership(ctx)
 	}
 }
 
+// tryAcquireLeadership attempts to become the leader.
 func (e *Election) tryAcquireLeadership(ctx context.Context) {
-	// ALWAYS check and update currentLeader first, regardless of cooldown.
-	// This ensures the cached leader value is accurate for health reporting.
+	// Check current leader state first
 	entry, err := e.kv.Get(ctx, "leader")
 	if err == nil {
-		// There's an existing leader
+		// Leader exists
 		existingLeader := string(entry.Value())
 		e.currentLeader = existingLeader
-		
-		// IMPORTANT: If the existing leader is THIS node but we don't think we're
-		// the leader (e.g., after a failed renewLeadership or daemon restart),
-		// we need to reclaim leadership. This fixes the race condition where
-		// isLeader=false but currentLeader=thisNode, causing the daemon to
-		// stay PASSIVE when it should be PRIMARY.
+		e.revision = entry.Revision()
+
+		// If we're the leader in KV but not locally, reclaim
 		if existingLeader == e.cfg.NodeID && !e.isLeader {
-			e.logger.Info("reclaiming leadership - leader key contains our node ID", 
-				"revision", entry.Revision())
+			e.logger.Info("reclaiming leadership", "revision", entry.Revision())
 			e.isLeader = true
-			e.revision = entry.Revision()
-			
-			// Notify through channel (non-blocking)
 			select {
 			case e.leaderCh <- struct{}{}:
 			default:
 			}
-			return
 		}
-		
-		e.logger.Debug("existing leader found", "leader", e.currentLeader)
 		return
 	}
 
@@ -282,23 +378,22 @@ func (e *Election) tryAcquireLeadership(ctx context.Context) {
 		return
 	}
 
-	// No leader exists - clear the cached leader value
+	// No leader - clear cached value
 	e.currentLeader = ""
 
-	// Check if this node is in cooldown (recently stepped down).
-	// Cooldown only prevents acquiring leadership, not knowing the leader state.
+	// Check cooldown
 	if e.isInCooldown(ctx) {
-		e.logger.Debug("in step-down cooldown, skipping leadership acquisition")
+		e.logger.Debug("in cooldown, skipping acquisition")
 		return
 	}
 
-	// No leader exists and not in cooldown, try to become leader
+	// Try to become leader using Create (CAS with revision 0)
 	rev, err := e.kv.Create(ctx, "leader", []byte(e.cfg.NodeID))
 	if err != nil {
 		// Someone else may have created it
-		entry, getErr := e.kv.Get(ctx, "leader")
-		if getErr == nil {
+		if entry, getErr := e.kv.Get(ctx, "leader"); getErr == nil {
 			e.currentLeader = string(entry.Value())
+			e.revision = entry.Revision()
 		}
 		e.logger.Debug("failed to acquire leadership", "error", err)
 		return
@@ -308,58 +403,85 @@ func (e *Election) tryAcquireLeadership(ctx context.Context) {
 	e.isLeader = true
 	e.currentLeader = e.cfg.NodeID
 	e.revision = rev
+	e.renewFailures = 0
 
 	e.logger.Info("acquired leadership", "revision", rev)
 
-	// Notify through channel (non-blocking)
+	// Notify via channel
 	select {
 	case e.leaderCh <- struct{}{}:
 	default:
 	}
 }
 
-// isInCooldown checks if this node recently stepped down and should not
-// attempt to acquire leadership yet. This allows other nodes time to
-// take over leadership during graceful failover.
+// isInCooldown checks if this node recently stepped down.
 func (e *Election) isInCooldown(ctx context.Context) bool {
-	cooldownKey := fmt.Sprintf("cooldown-%s", e.cfg.NodeID)
-	
+	cooldownKey := e.cooldownKey()
+
 	entry, err := e.kv.Get(ctx, cooldownKey)
 	if err != nil {
-		// No cooldown key exists or error reading it
 		return false
 	}
-	
-	// Parse the expiry timestamp
+
 	expiryMs, err := strconv.ParseInt(string(entry.Value()), 10, 64)
 	if err != nil {
 		e.logger.Warn("invalid cooldown value", "value", string(entry.Value()))
-		// Delete invalid cooldown key
 		_ = e.kv.Delete(ctx, cooldownKey)
 		return false
 	}
-	
+
 	nowMs := time.Now().UnixMilli()
 	if nowMs < expiryMs {
-		// Still in cooldown
-		remainingMs := expiryMs - nowMs
-		e.logger.Debug("cooldown active", "remaining_ms", remainingMs)
+		e.logger.Debug("cooldown active", "remaining_ms", expiryMs-nowMs)
 		return true
 	}
-	
-	// Cooldown expired, clean up the key
+
+	// Cooldown expired
 	_ = e.kv.Delete(ctx, cooldownKey)
 	return false
 }
 
-// maxRenewFailures is the number of consecutive renewal failures allowed before stepping down.
-// With a 3s heartbeat interval and 10s lease TTL, allowing 2 failures gives ~6s of tolerance
-// for transient NATS issues (network partition, server failover) before stepping down.
-// This prevents unnecessary leadership loss during brief NATS cluster disruptions.
+// maxRenewFailures is the number of consecutive renewal failures allowed.
 const maxRenewFailures = 2
 
-// isTransientNATSError returns true if the error is likely transient and
-// the operation should be retried rather than immediately stepping down.
+// renewLeadership renews the leadership lease.
+func (e *Election) renewLeadership(ctx context.Context) {
+	// Update the key to refresh TTL using CAS
+	rev, err := e.kv.Update(ctx, "leader", []byte(e.cfg.NodeID), e.revision)
+	if err != nil {
+		e.renewFailures++
+		e.logger.Warn("failed to renew leadership",
+			"error", err,
+			"consecutive_failures", e.renewFailures,
+			"max_failures", maxRenewFailures,
+			"is_transient", isTransientNATSError(err))
+
+		// For transient errors, allow more failures before stepping down
+		if isTransientNATSError(err) && e.renewFailures <= maxRenewFailures {
+			e.logger.Info("transient error, staying leader while client reconnects",
+				"failures", e.renewFailures)
+			return
+		}
+
+		// Too many failures - step down
+		if e.renewFailures > maxRenewFailures {
+			e.logger.Warn("too many renewal failures, stepping down")
+		}
+
+		e.isLeader = false
+		e.currentLeader = ""
+		e.revision = 0
+		e.renewFailures = 0
+		return
+	}
+
+	// Success
+	e.renewFailures = 0
+	e.revision = rev
+	e.logger.Debug("renewed leadership", "revision", rev)
+}
+
+// isTransientNATSError returns true if the error is likely transient.
 func isTransientNATSError(err error) bool {
 	if err == nil {
 		return false
@@ -367,7 +489,7 @@ func isTransientNATSError(err error) bool {
 
 	errStr := err.Error()
 
-	// Connection-level errors that indicate we should wait for NATS client reconnection
+	// Connection-level errors
 	if errors.Is(err, nats.ErrConnectionClosed) ||
 		errors.Is(err, nats.ErrTimeout) ||
 		errors.Is(err, nats.ErrNoResponders) ||
@@ -375,14 +497,13 @@ func isTransientNATSError(err error) bool {
 		return true
 	}
 
-	// JetStream cluster errors that indicate the cluster is temporarily unavailable
-	// but should recover (e.g., during leader election or network partition healing)
+	// JetStream cluster errors
 	if errors.Is(err, jetstream.ErrNoStreamResponse) ||
 		errors.Is(err, jetstream.ErrJetStreamNotEnabled) {
 		return true
 	}
 
-	// Check for common transient error messages
+	// Check for common transient error patterns
 	transientPatterns := []string{
 		"no responders",
 		"timeout",
@@ -395,59 +516,10 @@ func isTransientNATSError(err error) bool {
 	}
 
 	for _, pattern := range transientPatterns {
-		if contains(errStr, pattern) {
+		if strings.Contains(strings.ToLower(errStr), pattern) {
 			return true
 		}
 	}
 
 	return false
-}
-
-// contains performs a case-insensitive substring check.
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr || len(substr) == 0 ||
-		(len(s) > 0 && len(substr) > 0 && containsLower(strings.ToLower(s), strings.ToLower(substr))))
-}
-
-func containsLower(s, substr string) bool {
-	return strings.Contains(s, substr)
-}
-
-func (e *Election) renewLeadership(ctx context.Context) {
-	// Update the key to refresh TTL
-	rev, err := e.kv.Update(ctx, "leader", []byte(e.cfg.NodeID), e.revision)
-	if err != nil {
-		e.renewFailures++
-		e.logger.Warn("failed to renew leadership",
-			"error", err,
-			"consecutive_failures", e.renewFailures,
-			"max_failures", maxRenewFailures,
-			"is_transient", isTransientNATSError(err))
-
-		// For transient errors, allow more failures before stepping down.
-		// This gives the NATS client time to reconnect to another server.
-		if isTransientNATSError(err) && e.renewFailures <= maxRenewFailures {
-			e.logger.Info("transient NATS error during renewal, staying leader while client reconnects",
-				"failures", e.renewFailures,
-				"max", maxRenewFailures)
-			return
-		}
-
-		// For non-transient errors or too many consecutive failures, step down
-		if e.renewFailures > maxRenewFailures {
-			e.logger.Warn("too many consecutive renewal failures, stepping down",
-				"failures", e.renewFailures)
-		}
-
-		e.isLeader = false
-		e.currentLeader = ""
-		e.revision = 0
-		e.renewFailures = 0
-		return
-	}
-
-	// Success - reset failure counter
-	e.renewFailures = 0
-	e.revision = rev
-	e.logger.Debug("renewed leadership", "revision", rev)
 }

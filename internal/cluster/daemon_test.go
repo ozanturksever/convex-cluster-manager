@@ -13,7 +13,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/ozanturksever/convex-cluster-manager/internal/config"
-	"github.com/ozanturksever/convex-cluster-manager/internal/health"
 	"github.com/ozanturksever/convex-cluster-manager/testutil"
 
 	_ "modernc.org/sqlite"
@@ -336,7 +335,7 @@ func TestDaemonGracefulStepdown(t *testing.T) {
 	}
 }
 
-func TestDaemonHealthCheckerCrossNodeQuery(t *testing.T) {
+func TestDaemonServiceCrossNodeQuery(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
 	}
@@ -348,7 +347,7 @@ func TestDaemonHealthCheckerCrossNodeQuery(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = natsContainer.Stop(ctx) }()
 
-	clusterID := "daemon-health-query"
+	clusterID := "daemon-service-query"
 	tmpDir := t.TempDir()
 
 	// Create Object Store bucket for WAL replication
@@ -393,24 +392,24 @@ func TestDaemonHealthCheckerCrossNodeQuery(t *testing.T) {
 		errCh2 <- daemon2.Run(daemon2Ctx)
 	}()
 
-	// Give daemon 2 time to start and set up health checker
+	// Give daemon 2 time to start and set up service
 	time.Sleep(2 * time.Second)
 
-	// Create a separate health checker client to query both nodes
-	clientCfg := health.Config{
+	// Create a separate service client to query both nodes
+	clientCfg := ServiceConfig{
 		ClusterID: clusterID,
 		NodeID:    "query-client",
 		NATSURLs:  []string{natsContainer.URL},
 	}
-	client, err := health.NewChecker(clientCfg)
+	client, err := NewService(clientCfg)
 	require.NoError(t, err)
 
 	err = client.Start(ctx)
 	require.NoError(t, err)
 	defer client.Stop()
 
-	// Query node 1's health
-	resp1, err := client.QueryNode(ctx, "node-1", 5*time.Second)
+	// Query node 1's status
+	resp1, err := client.QueryNodeStatus(ctx, "node-1", 5*time.Second)
 	require.NoError(t, err)
 
 	assert.Equal(t, "node-1", resp1.NodeID)
@@ -418,8 +417,8 @@ func TestDaemonHealthCheckerCrossNodeQuery(t *testing.T) {
 	assert.Equal(t, "node-1", resp1.Leader)
 	assert.NotZero(t, resp1.Timestamp)
 
-	// Query node 2's health
-	resp2, err := client.QueryNode(ctx, "node-2", 5*time.Second)
+	// Query node 2's status
+	resp2, err := client.QueryNodeStatus(ctx, "node-2", 5*time.Second)
 	require.NoError(t, err)
 
 	assert.Equal(t, "node-2", resp2.NodeID)
@@ -444,7 +443,7 @@ func TestDaemonHealthCheckerCrossNodeQuery(t *testing.T) {
 	}
 }
 
-func TestDaemonRoleTransitionsUpdateHealth(t *testing.T) {
+func TestDaemonRoleTransitionsUpdateStatus(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
 	}
@@ -506,27 +505,27 @@ func TestDaemonRoleTransitionsUpdateHealth(t *testing.T) {
 	time.Sleep(2 * time.Second)
 	require.Equal(t, RolePassive, daemon2.state.Role(), "node-2 should be passive")
 
-	// Create a client to query health
-	clientCfg := health.Config{
+	// Create a service client to query node status
+	clientCfg := ServiceConfig{
 		ClusterID: clusterID,
 		NodeID:    "query-client",
 		NATSURLs:  []string{natsContainer.URL},
 	}
-	client, err := health.NewChecker(clientCfg)
+	client, err := NewService(clientCfg)
 	require.NoError(t, err)
 
 	err = client.Start(ctx)
 	require.NoError(t, err)
 	defer client.Stop()
 
-	// Query health when node-1 is PRIMARY
-	resp, err := client.QueryNode(ctx, "node-1", 5*time.Second)
+	// Query status when node-1 is PRIMARY
+	resp, err := client.QueryNodeStatus(ctx, "node-1", 5*time.Second)
 	require.NoError(t, err)
 	assert.Equal(t, "PRIMARY", resp.Role)
 	assert.Equal(t, "node-1", resp.Leader)
 
-	// Query health when node-2 is PASSIVE
-	resp, err = client.QueryNode(ctx, "node-2", 5*time.Second)
+	// Query status when node-2 is PASSIVE
+	resp, err = client.QueryNodeStatus(ctx, "node-2", 5*time.Second)
 	require.NoError(t, err)
 	assert.Equal(t, "PASSIVE", resp.Role)
 	assert.Equal(t, "node-1", resp.Leader)
@@ -549,13 +548,13 @@ func TestDaemonRoleTransitionsUpdateHealth(t *testing.T) {
 	}
 	require.Equal(t, RolePrimary, daemon2.state.Role(), "node-2 should become leader after node-1 fails")
 
-	// Give health checker time to update
+	// Give service time to update
 	time.Sleep(500 * time.Millisecond)
 
-	// Query health - node-2 should now be PRIMARY
-	resp, err = client.QueryNode(ctx, "node-2", 5*time.Second)
+	// Query status - node-2 should now be PRIMARY
+	resp, err = client.QueryNodeStatus(ctx, "node-2", 5*time.Second)
 	require.NoError(t, err)
-	assert.Equal(t, "PRIMARY", resp.Role, "node-2 health should report PRIMARY after failover")
+	assert.Equal(t, "PRIMARY", resp.Role, "node-2 status should report PRIMARY after failover")
 	assert.Equal(t, "node-2", resp.Leader)
 
 	// Shutdown daemon2
@@ -942,6 +941,7 @@ func TestNewDaemonValidation(t *testing.T) {
 		assert.NotNil(t, daemon.backend)
 		assert.NotNil(t, daemon.primary)
 		assert.NotNil(t, daemon.passive)
-		assert.NotNil(t, daemon.health)
+		assert.NotNil(t, daemon.service)
+		assert.NotNil(t, daemon.stateManager)
 	})
 }

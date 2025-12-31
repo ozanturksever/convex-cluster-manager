@@ -15,7 +15,6 @@ import (
 
 	"github.com/ozanturksever/convex-cluster-manager/internal/backend"
 	"github.com/ozanturksever/convex-cluster-manager/internal/config"
-	"github.com/ozanturksever/convex-cluster-manager/internal/health"
 	"github.com/ozanturksever/convex-cluster-manager/internal/replication"
 	"github.com/ozanturksever/convex-cluster-manager/internal/vip"
 
@@ -24,22 +23,32 @@ import (
 
 // Daemon composes leader election, state management, backend control,
 // VIP management, WAL replication (primary/passive), and the NATS-based
-// health checker into a single long-running process.
+// nats.micro service into a single long-running process.
 type Daemon struct {
 	cfg    *config.Config
 	logger *slog.Logger
 
-	state    *State
-	election *Election
+	state        *State
+	election     *Election
+	stateManager *StateManager // KV-backed persistent state
 
 	backend     *backend.Controller
 	vip         *vip.Manager
 	primary     *replication.Primary
 	passive     *replication.Passive
 	snapshotter *replication.Snapshotter
-	health      *health.Checker
+	service     *Service // nats.micro service for health/discovery
 
 	exec *systemExecutor
+
+	// Status fields for StatusProvider interface
+	statusMu       sync.RWMutex
+	role           string
+	leader         string
+	backendStatus  string
+	replicationLag int64
+	walSequence    uint64
+	startedAt      time.Time
 
 	ctxMu sync.RWMutex
 	ctx   context.Context
@@ -158,17 +167,31 @@ func NewDaemon(cfg *config.Config) (*Daemon, error) {
 		return nil, fmt.Errorf("create snapshotter: %w", err)
 	}
 
-	// Health checker over NATS request/reply.
-	hCfg := health.Config{
-		ClusterID: cfg.ClusterID,
-		NodeID:    cfg.NodeID,
-		NATSURLs:  cfg.NATS.Servers,
+	// nats.micro service for health and discovery.
+	svcCfg := ServiceConfig{
+		ClusterID:       cfg.ClusterID,
+		NodeID:          cfg.NodeID,
+		NATSURLs:        cfg.NATS.Servers,
+		NATSCredentials: cfg.NATS.Credentials,
 	}
-	if d.health, err = health.NewChecker(hCfg); err != nil {
-		return nil, fmt.Errorf("create health checker: %w", err)
+	if d.service, err = NewService(svcCfg); err != nil {
+		return nil, fmt.Errorf("create service: %w", err)
 	}
-	d.health.SetRole("PASSIVE")
-	d.health.SetBackendStatus("stopped")
+	// Wire daemon as the status provider for the service.
+	d.service.SetStatusProvider(d)
+	d.role = "PASSIVE"
+	d.backendStatus = "stopped"
+
+	// KV-backed state manager for persistent cluster state.
+	stateCfg := StateConfig{
+		ClusterID:       cfg.ClusterID,
+		NodeID:          cfg.NodeID,
+		NATSURLs:        cfg.NATS.Servers,
+		NATSCredentials: cfg.NATS.Credentials,
+	}
+	if d.stateManager, err = NewStateManager(stateCfg); err != nil {
+		return nil, fmt.Errorf("create state manager: %w", err)
+	}
 
 	// Wire state callbacks to side-effectful operations.
 	d.state.OnBecomeLeader(func() {
@@ -180,7 +203,7 @@ func NewDaemon(cfg *config.Config) (*Daemon, error) {
 	})
 
 	d.state.OnLeaderChange(func(leader string) {
-		d.health.SetLeader(leader)
+		d.setLeader(leader)
 	})
 
 	return d, nil
@@ -203,6 +226,75 @@ func (d *Daemon) getCtx() context.Context {
 	return context.Background()
 }
 
+// GetStatus implements the StatusProvider interface for the nats.micro service.
+// It returns the current status of this cluster node.
+func (d *Daemon) GetStatus() NodeStatus {
+	d.statusMu.RLock()
+	defer d.statusMu.RUnlock()
+
+	return NodeStatus{
+		NodeID:         d.cfg.NodeID,
+		ClusterID:      d.cfg.ClusterID,
+		Role:           d.role,
+		Leader:         d.leader,
+		BackendStatus:  d.backendStatus,
+		ReplicationLag: d.replicationLag,
+		WALSequence:    d.walSequence,
+	}
+}
+
+// setRole updates the role status and persists to KV.
+func (d *Daemon) setRole(role string) {
+	d.statusMu.Lock()
+	d.role = role
+	backendStatus := d.backendStatus
+	d.statusMu.Unlock()
+
+	// Persist to KV state (best effort)
+	d.persistState(role, backendStatus)
+}
+
+// setLeader updates the leader status.
+func (d *Daemon) setLeader(leader string) {
+	d.statusMu.Lock()
+	defer d.statusMu.Unlock()
+	d.leader = leader
+}
+
+// setBackendStatus updates the backend status and persists to KV.
+func (d *Daemon) setBackendStatus(status string) {
+	d.statusMu.Lock()
+	role := d.role
+	d.backendStatus = status
+	d.statusMu.Unlock()
+
+	// Persist to KV state (best effort)
+	d.persistState(role, status)
+}
+
+// setReplicationLag updates the replication lag in milliseconds.
+func (d *Daemon) setReplicationLag(lagMs int64) {
+	d.statusMu.Lock()
+	defer d.statusMu.Unlock()
+	d.replicationLag = lagMs
+}
+
+// persistState persists the current node state to the KV store.
+// This is called whenever role or backend status changes.
+// Errors are logged but not returned since state persistence is best-effort.
+func (d *Daemon) persistState(role, backendStatus string) {
+	if d.stateManager == nil || !d.stateManager.Running() {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := d.stateManager.UpdateOwnState(ctx, role, backendStatus); err != nil {
+		d.logger.Warn("failed to persist node state to KV", "error", err)
+	}
+}
+
 // handleBecomeLeader is invoked when this node transitions to PRIMARY.
 // It starts the backend, acquires the VIP, enables primary replication
 // and snapshots, and updates health state.
@@ -215,8 +307,8 @@ func (d *Daemon) handleBecomeLeader() {
 	ctx := d.getCtx()
 
 	d.logger.Info("becoming PRIMARY")
-	d.health.SetRole("PRIMARY")
-	d.health.SetLeader(d.cfg.NodeID)
+	d.setRole("PRIMARY")
+	d.setLeader(d.cfg.NodeID)
 
 	// Perform a final catch-up on the replica before stopping passive replication.
 	// This ensures we have the latest data from the previous primary.
@@ -308,9 +400,9 @@ func (d *Daemon) handleBecomeLeader() {
 	// Start backend service.
 	if err := d.backend.Start(ctx); err != nil {
 		d.logger.Error("failed to start backend service", "error", err)
-		d.health.SetBackendStatus("failed")
+		d.setBackendStatus("failed")
 	} else {
-		d.health.SetBackendStatus("running")
+		d.setBackendStatus("running")
 	}
 
 	// Start primary WAL replication, WAL mode verification, and snapshotter in a single goroutine.
@@ -369,7 +461,7 @@ func (d *Daemon) startPrimaryReplicationWithRetry(ctx context.Context) {
 	// Step 1: Verify WAL mode is enabled
 	if err := verifyWALMode(dbPath); err != nil {
 		d.logger.Error("WAL mode verification failed - replication will not work correctly", "error", err)
-		d.health.SetBackendStatus("running-no-wal")
+		d.setBackendStatus("running-no-wal")
 		// Continue anyway - replication might still work if WAL mode is enabled later
 	} else {
 		d.logger.Info("WAL mode verified for database", "path", dbPath)
@@ -399,7 +491,7 @@ func (d *Daemon) handleStepDown() {
 	defer cancelStepDown()
 
 	d.logger.Info("stepping down to PASSIVE")
-	d.health.SetRole("PASSIVE")
+	d.setRole("PASSIVE")
 
 	// Stop snapshotter first so no new snapshots are taken.
 	if err := d.snapshotter.Stop(stepDownCtx); err != nil {
@@ -415,7 +507,7 @@ func (d *Daemon) handleStepDown() {
 	if err := d.backend.Stop(stepDownCtx); err != nil {
 		d.logger.Error("failed to stop backend service", "error", err)
 	}
-	d.health.SetBackendStatus("stopped")
+	d.setBackendStatus("stopped")
 
 	// Release VIP.
 	if d.vip != nil {
@@ -438,7 +530,7 @@ func (d *Daemon) handleStepDown() {
 	}
 
 	if lag, err := d.passive.ReplicationLag(stepDownCtx); err == nil {
-		d.health.SetReplicationLag(uint64(lag.Milliseconds()))
+		d.setReplicationLag(lag.Milliseconds())
 	}
 }
 
@@ -661,8 +753,8 @@ func verifyWALMode(dbPath string) error {
 }
 
 // Run starts the daemon and blocks until the context is cancelled or a
-// fatal error occurs. It owns the lifetime of the election and health
-// checker; backend, VIP, and replication components are managed via
+// fatal error occurs. It owns the lifetime of the election and nats.micro
+// service; backend, VIP, and replication components are managed via
 // state callbacks.
 func (d *Daemon) Run(ctx context.Context) error {
 	d.setCtx(ctx)
@@ -683,16 +775,36 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 	defer d.election.Stop()
 
-	// Start health checker.
-	if err := d.health.Start(ctx); err != nil {
-		return fmt.Errorf("start health checker: %w", err)
+	// Start nats.micro service for health and discovery.
+	if err := d.service.Start(ctx); err != nil {
+		return fmt.Errorf("start service: %w", err)
 	}
-	defer d.health.Stop()
+	defer d.service.Stop()
+
+	// Start KV-backed state manager.
+	if err := d.stateManager.Start(ctx); err != nil {
+		return fmt.Errorf("start state manager: %w", err)
+	}
+	defer func() {
+		// Clean up node state from KV on shutdown to avoid stale entries
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = d.stateManager.DeleteNodeState(cleanupCtx, d.cfg.NodeID)
+		cancel()
+		_ = d.stateManager.Stop()
+	}()
+
+	// Record start time for uptime tracking.
+	d.statusMu.Lock()
+	d.startedAt = time.Now()
+	d.statusMu.Unlock()
+
+	// Persist initial state to KV.
+	d.persistState(d.role, d.backendStatus)
 
 	// Initialize leader information.
 	leader := d.election.CurrentLeader()
 	d.state.SetLeader(leader)
-	d.health.SetLeader(leader)
+	d.setLeader(leader)
 
 	// Initialize role based on current election state.
 	if d.election.IsLeader() {
@@ -704,7 +816,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		if err := d.passive.Start(ctx); err != nil {
 			d.logger.Error("failed to start passive replication on startup", "error", err)
 		}
-		d.health.SetRole("PASSIVE")
+		d.setRole("PASSIVE")
 	}
 
 	ticker := time.NewTicker(5 * time.Second)
@@ -799,7 +911,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 			}
 
 			// When not leader, keep the passive replica reasonably up to date
-			// and publish replication lag into the health checker.
+			// and publish replication lag into the service status.
 			if !isLeader {
 				if err := d.passive.Start(ctx); err != nil {
 					d.logger.Error("failed to start passive replication", "error", err)
@@ -807,7 +919,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 					if _, err := d.passive.CatchUp(ctx); err != nil {
 						d.logger.Error("passive catch-up error", "error", err)
 					} else if lag, err := d.passive.ReplicationLag(ctx); err == nil {
-						d.health.SetReplicationLag(uint64(lag.Milliseconds()))
+						d.setReplicationLag(lag.Milliseconds())
 					}
 				}
 			}

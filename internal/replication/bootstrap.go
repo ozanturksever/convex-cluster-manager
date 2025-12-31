@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 
 	"github.com/benbjohnson/litestream"
-	litestreamnats "github.com/benbjohnson/litestream/nats"
+	_ "github.com/benbjohnson/litestream/nats" // Required for litestream NATS backend
 )
 
 // ErrNoSnapshots is returned when no snapshots are available for bootstrap.
@@ -77,13 +77,13 @@ func Bootstrap(ctx context.Context, cfg BootstrapConfig) error {
 		return fmt.Errorf("create output directory: %w", err)
 	}
 
-	// Create NATS replica client.
-	client := litestreamnats.NewReplicaClient()
-	client.URL = cfg.NATSURLs[0]
-	client.BucketName = cfg.BucketName()
-	if cfg.NATSCredentials != "" {
-		client.Creds = cfg.NATSCredentials
-	}
+	// Create NATS replica client with all URLs for automatic failover.
+	client := NewReplicaClient(ReplicaClientConfig{
+		NATSURLs:        cfg.NATSURLs,
+		NATSCredentials: cfg.NATSCredentials,
+		BucketName:      cfg.BucketName(),
+		Logger:          logger,
+	})
 
 	// Create replica without an attached DB (for restore-only operation).
 	replica := litestream.NewReplica(nil)

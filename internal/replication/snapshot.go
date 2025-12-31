@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
@@ -118,13 +117,13 @@ func (s *Snapshotter) Start(ctx context.Context) error {
 	db := litestream.NewDB(s.cfg.DBPath)
 
 	// Configure NATS replica client with all URLs for automatic failover.
-	client := litestreamnats.NewReplicaClient()
-	client.URL = strings.Join(s.cfg.NATSURLs, ",")
-	client.BucketName = s.BucketName()
-	client.Path = s.cfg.ReplicaPath
-	if s.cfg.NATSCredentials != "" {
-		client.Creds = s.cfg.NATSCredentials
-	}
+	client := NewReplicaClient(ReplicaClientConfig{
+		NATSURLs:        s.cfg.NATSURLs,
+		NATSCredentials: s.cfg.NATSCredentials,
+		BucketName:      s.BucketName(),
+		Path:            s.cfg.ReplicaPath,
+		Logger:          s.logger,
+	})
 
 	// Attach replica to DB.
 	replica := litestream.NewReplicaWithClient(db, client)
