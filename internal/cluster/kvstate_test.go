@@ -55,7 +55,7 @@ func TestStateManager(t *testing.T) {
 
 		err = sm.Start(ctx)
 		require.NoError(t, err)
-		defer sm.Stop()
+		defer func() { _ = sm.Stop() }()
 
 		// Set state
 		state := &NodeState{
@@ -89,7 +89,7 @@ func TestStateManager(t *testing.T) {
 
 		err = sm.Start(ctx)
 		require.NoError(t, err)
-		defer sm.Stop()
+		defer func() { _ = sm.Stop() }()
 
 		_, err = sm.GetNodeState(ctx, "nonexistent-node")
 		assert.ErrorIs(t, err, ErrNodeNotFound)
@@ -107,7 +107,7 @@ func TestStateManager(t *testing.T) {
 
 		err = sm.Start(ctx)
 		require.NoError(t, err)
-		defer sm.Stop()
+		defer func() { _ = sm.Stop() }()
 
 		// Set state
 		state := &NodeState{
@@ -144,7 +144,7 @@ func TestStateManager(t *testing.T) {
 
 		err = sm.Start(ctx)
 		require.NoError(t, err)
-		defer sm.Stop()
+		defer func() { _ = sm.Stop() }()
 
 		// Set multiple node states
 		for i, nodeID := range []string{"node-1", "node-2", "node-3"} {
@@ -185,7 +185,7 @@ func TestStateManager(t *testing.T) {
 
 		err = sm.Start(ctx)
 		require.NoError(t, err)
-		defer sm.Stop()
+		defer func() { _ = sm.Stop() }()
 
 		// Start watching
 		watchCtx, cancel := context.WithCancel(ctx)
@@ -260,7 +260,7 @@ func TestStateManager(t *testing.T) {
 
 		err = sm.Start(ctx)
 		require.NoError(t, err)
-		defer sm.Stop()
+		defer func() { _ = sm.Stop() }()
 
 		// Start watching node-1
 		watchCtx, cancel := context.WithCancel(ctx)
@@ -322,7 +322,7 @@ func TestStateManager(t *testing.T) {
 
 		err = sm.Start(ctx)
 		require.NoError(t, err)
-		defer sm.Stop()
+		defer func() { _ = sm.Stop() }()
 
 		// Update own state
 		err = sm.UpdateOwnState(ctx, "PRIMARY", "running")
@@ -356,11 +356,11 @@ func TestStateManager(t *testing.T) {
 
 		err = sm1.Start(ctx)
 		require.NoError(t, err)
-		defer sm1.Stop()
+		defer func() { _ = sm1.Stop() }()
 
 		err = sm2.Start(ctx)
 		require.NoError(t, err)
-		defer sm2.Stop()
+		defer func() { _ = sm2.Stop() }()
 
 		// sm1 sets node-1 state
 		err = sm1.UpdateOwnState(ctx, "PRIMARY", "running")

@@ -139,7 +139,7 @@ func (s *Service) Start(ctx context.Context) error {
 	statusSubject := s.cfg.SubjectBase() + ".status"
 	err = svc.AddEndpoint("status", micro.HandlerFunc(s.handleStatus), micro.WithEndpointSubject(statusSubject))
 	if err != nil {
-		svc.Stop()
+		_ = svc.Stop()
 		nc.Close()
 		return fmt.Errorf("add status endpoint: %w", err)
 	}
@@ -284,7 +284,7 @@ func (s *Service) DiscoverNodes(ctx context.Context) (map[string]*micro.Info, er
 	if err != nil {
 		return nil, fmt.Errorf("subscribe to inbox: %w", err)
 	}
-	defer sub.Unsubscribe()
+	defer func() { _ = sub.Unsubscribe() }()
 
 	// Publish discovery request
 	if err := s.nc.PublishRequest(infoSubject, inbox, nil); err != nil {

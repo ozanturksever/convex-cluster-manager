@@ -555,6 +555,8 @@ func (d *Daemon) forcePromoteReplicaToData(_ context.Context) error {
 //
 // NOTE: Prefer forcePromoteReplicaToData when you know the replica was just
 // restored from NATS, as this function's comparison logic may be unreliable.
+//
+//nolint:unused // Reserved for future use in manual promotion scenarios
 func (d *Daemon) promoteReplicaToData(_ context.Context) error {
 	return d.doPromoteReplicaToData(false)
 }
@@ -779,7 +781,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	if err := d.service.Start(ctx); err != nil {
 		return fmt.Errorf("start service: %w", err)
 	}
-	defer d.service.Stop()
+	defer func() { _ = d.service.Stop() }()
 
 	// Start KV-backed state manager.
 	if err := d.stateManager.Start(ctx); err != nil {

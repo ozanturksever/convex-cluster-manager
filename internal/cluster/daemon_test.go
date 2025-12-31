@@ -406,7 +406,7 @@ func TestDaemonServiceCrossNodeQuery(t *testing.T) {
 
 	err = client.Start(ctx)
 	require.NoError(t, err)
-	defer client.Stop()
+	defer func() { _ = client.Stop() }()
 
 	// Query node 1's status
 	resp1, err := client.QueryNodeStatus(ctx, "node-1", 5*time.Second)
@@ -516,7 +516,7 @@ func TestDaemonRoleTransitionsUpdateStatus(t *testing.T) {
 
 	err = client.Start(ctx)
 	require.NoError(t, err)
-	defer client.Stop()
+	defer func() { _ = client.Stop() }()
 
 	// Query status when node-1 is PRIMARY
 	resp, err := client.QueryNodeStatus(ctx, "node-1", 5*time.Second)

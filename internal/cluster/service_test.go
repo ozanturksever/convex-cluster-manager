@@ -77,7 +77,7 @@ func TestService(t *testing.T) {
 
 		err = svc.Start(ctx)
 		require.NoError(t, err)
-		defer svc.Stop()
+		defer func() { _ = svc.Stop() }()
 
 		// Connect and query status
 		nc, err := nats.Connect(natsContainer.URL)
@@ -116,7 +116,7 @@ func TestService(t *testing.T) {
 
 		err = svc.Start(ctx)
 		require.NoError(t, err)
-		defer svc.Stop()
+		defer func() { _ = svc.Stop() }()
 
 		nc, err := nats.Connect(natsContainer.URL)
 		require.NoError(t, err)
@@ -172,11 +172,11 @@ func TestService(t *testing.T) {
 
 		err = svc1.Start(ctx)
 		require.NoError(t, err)
-		defer svc1.Stop()
+		defer func() { _ = svc1.Stop() }()
 
 		err = svc2.Start(ctx)
 		require.NoError(t, err)
-		defer svc2.Stop()
+		defer func() { _ = svc2.Stop() }()
 
 		// Node 2 queries node 1's status
 		status, err := svc2.QueryNodeStatus(ctx, "node-1", 5*time.Second)
@@ -204,7 +204,7 @@ func TestService(t *testing.T) {
 
 		err = svc.Start(ctx)
 		require.NoError(t, err)
-		defer svc.Stop()
+		defer func() { _ = svc.Stop() }()
 
 		info := svc.Info()
 		require.NotNil(t, info)
@@ -226,7 +226,7 @@ func TestService(t *testing.T) {
 
 		err = svc.Start(ctx)
 		require.NoError(t, err)
-		defer svc.Stop()
+		defer func() { _ = svc.Stop() }()
 
 		stats := svc.Stats()
 		require.NotNil(t, stats)

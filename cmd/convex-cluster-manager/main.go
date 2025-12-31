@@ -385,7 +385,7 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	if err := svc.Start(ctx); err != nil {
 		return fmt.Errorf("failed to start service: %w", err)
 	}
-	defer svc.Stop()
+	defer func() { _ = svc.Stop() }()
 
 	// Query this node's daemon status
 	resp, err := svc.QueryNodeStatus(ctx, cfg.NodeID, 5*time.Second)
