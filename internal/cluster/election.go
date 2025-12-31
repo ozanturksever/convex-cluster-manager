@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"log/slog"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
+	"github.com/ozanturksever/convex-cluster-manager/internal/natsutil"
 )
 
 // ElectionConfig contains configuration for leader election.
@@ -35,6 +37,10 @@ type Election struct {
 	isLeader      bool
 	currentLeader string
 	revision      uint64
+
+	// renewFailures tracks consecutive renewal failures to implement graceful degradation.
+	// We only step down after multiple consecutive failures to handle transient NATS issues.
+	renewFailures int
 
 	leaderCh chan struct{}
 	stopCh   chan struct{}
@@ -74,17 +80,12 @@ func (e *Election) Start(ctx context.Context) error {
 	// Reset stop channel for restart capability
 	e.stopCh = make(chan struct{})
 
-	// Connect to NATS
-	opts := []nats.Option{
-		nats.MaxReconnects(-1),
-		nats.ReconnectWait(2 * time.Second),
-	}
-
-	if e.cfg.NATSCredentials != "" {
-		opts = append(opts, nats.UserCredentials(e.cfg.NATSCredentials))
-	}
-
-	nc, err := nats.Connect(e.cfg.NATSURLs[0], opts...)
+	// Connect to NATS with automatic failover and cluster discovery
+	nc, err := natsutil.Connect(natsutil.ConnectOptions{
+		URLs:        e.cfg.NATSURLs,
+		Credentials: e.cfg.NATSCredentials,
+		Logger:      e.logger,
+	})
 	if err != nil {
 		return fmt.Errorf("failed to connect to NATS: %w", err)
 	}
@@ -351,17 +352,102 @@ func (e *Election) isInCooldown(ctx context.Context) bool {
 	return false
 }
 
+// maxRenewFailures is the number of consecutive renewal failures allowed before stepping down.
+// With a 3s heartbeat interval and 10s lease TTL, allowing 2 failures gives ~6s of tolerance
+// for transient NATS issues (network partition, server failover) before stepping down.
+// This prevents unnecessary leadership loss during brief NATS cluster disruptions.
+const maxRenewFailures = 2
+
+// isTransientNATSError returns true if the error is likely transient and
+// the operation should be retried rather than immediately stepping down.
+func isTransientNATSError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	errStr := err.Error()
+
+	// Connection-level errors that indicate we should wait for NATS client reconnection
+	if errors.Is(err, nats.ErrConnectionClosed) ||
+		errors.Is(err, nats.ErrTimeout) ||
+		errors.Is(err, nats.ErrNoResponders) ||
+		errors.Is(err, nats.ErrDisconnected) {
+		return true
+	}
+
+	// JetStream cluster errors that indicate the cluster is temporarily unavailable
+	// but should recover (e.g., during leader election or network partition healing)
+	if errors.Is(err, jetstream.ErrNoStreamResponse) ||
+		errors.Is(err, jetstream.ErrJetStreamNotEnabled) {
+		return true
+	}
+
+	// Check for common transient error messages
+	transientPatterns := []string{
+		"no responders",
+		"timeout",
+		"connection closed",
+		"cluster not available",
+		"meta leader",
+		"raft",
+		"context deadline",
+		"context canceled",
+	}
+
+	for _, pattern := range transientPatterns {
+		if contains(errStr, pattern) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// contains performs a case-insensitive substring check.
+func contains(s, substr string) bool {
+	return len(s) >= len(substr) && (s == substr || len(substr) == 0 ||
+		(len(s) > 0 && len(substr) > 0 && containsLower(strings.ToLower(s), strings.ToLower(substr))))
+}
+
+func containsLower(s, substr string) bool {
+	return strings.Contains(s, substr)
+}
+
 func (e *Election) renewLeadership(ctx context.Context) {
 	// Update the key to refresh TTL
 	rev, err := e.kv.Update(ctx, "leader", []byte(e.cfg.NodeID), e.revision)
 	if err != nil {
-		e.logger.Warn("failed to renew leadership", "error", err)
+		e.renewFailures++
+		e.logger.Warn("failed to renew leadership",
+			"error", err,
+			"consecutive_failures", e.renewFailures,
+			"max_failures", maxRenewFailures,
+			"is_transient", isTransientNATSError(err))
+
+		// For transient errors, allow more failures before stepping down.
+		// This gives the NATS client time to reconnect to another server.
+		if isTransientNATSError(err) && e.renewFailures <= maxRenewFailures {
+			e.logger.Info("transient NATS error during renewal, staying leader while client reconnects",
+				"failures", e.renewFailures,
+				"max", maxRenewFailures)
+			return
+		}
+
+		// For non-transient errors or too many consecutive failures, step down
+		if e.renewFailures > maxRenewFailures {
+			e.logger.Warn("too many consecutive renewal failures, stepping down",
+				"failures", e.renewFailures)
+		}
+
 		e.isLeader = false
 		e.currentLeader = ""
 		e.revision = 0
+		e.renewFailures = 0
 		return
 	}
 
+	// Success - reset failure counter
+	e.renewFailures = 0
 	e.revision = rev
 	e.logger.Debug("renewed leadership", "revision", rev)
 }

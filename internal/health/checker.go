@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/nats-io/nats.go"
+	"github.com/ozanturksever/convex-cluster-manager/internal/natsutil"
 )
 
 // Config contains configuration for the health checker.
@@ -93,7 +94,11 @@ func (c *Checker) Start(ctx context.Context) error {
 		return fmt.Errorf("no NATS URLs configured")
 	}
 
-	nc, err := nats.Connect(c.cfg.NATSURLs[0])
+	// Connect to NATS with automatic failover and cluster discovery
+	nc, err := natsutil.Connect(natsutil.ConnectOptions{
+		URLs:   c.cfg.NATSURLs,
+		Logger: c.logger,
+	})
 	if err != nil {
 		return fmt.Errorf("connect NATS: %w", err)
 	}
@@ -200,7 +205,10 @@ func (c *Checker) QueryNode(ctx context.Context, nodeID string, timeout time.Dur
 		if len(urls) == 0 {
 			return HealthResponse{}, fmt.Errorf("no NATS URLs configured")
 		}
-		tmp, errConn := nats.Connect(urls[0])
+		// Connect to NATS with automatic failover and cluster discovery
+		tmp, errConn := natsutil.Connect(natsutil.ConnectOptions{
+			URLs: urls,
+		})
 		if errConn != nil {
 			return HealthResponse{}, fmt.Errorf("connect NATS: %w", errConn)
 		}

@@ -79,8 +79,9 @@ func (p *Passive) Start(ctx context.Context) error { // ctx is reserved for futu
 		return fmt.Errorf("create replica directory: %w", err)
 	}
 
+	// Configure NATS replica client with all URLs for automatic failover.
 	client := litestreamnats.NewReplicaClient()
-	client.URL = p.cfg.NATSURLs[0]
+	client.URL = strings.Join(p.cfg.NATSURLs, ",")
 	client.BucketName = p.BucketName()
 	client.Path = p.cfg.ReplicaPath
 	if p.cfg.NATSCredentials != "" {

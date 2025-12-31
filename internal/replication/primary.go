@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -125,9 +126,9 @@ func (p *Primary) Start(ctx context.Context) error {
 	// Create litestream DB wrapper for the backend database.
 	db := litestream.NewDB(p.cfg.DBPath)
 
-	// Configure NATS replica client.
+	// Configure NATS replica client with all URLs for automatic failover.
 	client := litestreamnats.NewReplicaClient()
-	client.URL = p.cfg.NATSURLs[0]
+	client.URL = strings.Join(p.cfg.NATSURLs, ",")
 	client.BucketName = p.BucketName()
 	client.Path = p.cfg.ReplicaPath
 	if p.cfg.NATSCredentials != "" {

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -116,9 +117,9 @@ func (s *Snapshotter) Start(ctx context.Context) error {
 	// Create litestream DB wrapper for the target database.
 	db := litestream.NewDB(s.cfg.DBPath)
 
-	// Configure NATS replica client used as an Object Store backend.
+	// Configure NATS replica client with all URLs for automatic failover.
 	client := litestreamnats.NewReplicaClient()
-	client.URL = s.cfg.NATSURLs[0]
+	client.URL = strings.Join(s.cfg.NATSURLs, ",")
 	client.BucketName = s.BucketName()
 	client.Path = s.cfg.ReplicaPath
 	if s.cfg.NATSCredentials != "" {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 
 	"github.com/benbjohnson/litestream"
 	litestreamnats "github.com/benbjohnson/litestream/nats"
@@ -154,8 +155,9 @@ func (ic *IntegrityChecker) checkReplica(ctx context.Context, report *IntegrityR
 		return nil // No replica configured
 	}
 
+	// Configure NATS replica client with all URLs for automatic failover.
 	client := litestreamnats.NewReplicaClient()
-	client.URL = ic.cfg.NATSURLs[0]
+	client.URL = strings.Join(ic.cfg.NATSURLs, ",")
 	client.BucketName = fmt.Sprintf("convex-%s-wal", ic.cfg.ClusterID)
 	client.Path = ic.cfg.ReplicaPath
 	if ic.cfg.NATSCredentials != "" {
@@ -193,8 +195,9 @@ func (ic *IntegrityChecker) ValidateLTXFile(ctx context.Context, level int, minT
 		return fmt.Errorf("no NATS URL configured")
 	}
 
+	// Configure NATS replica client with all URLs for automatic failover.
 	client := litestreamnats.NewReplicaClient()
-	client.URL = ic.cfg.NATSURLs[0]
+	client.URL = strings.Join(ic.cfg.NATSURLs, ",")
 	client.BucketName = fmt.Sprintf("convex-%s-wal", ic.cfg.ClusterID)
 	client.Path = ic.cfg.ReplicaPath
 	if ic.cfg.NATSCredentials != "" {
@@ -234,8 +237,9 @@ func (ic *IntegrityChecker) ValidateAllLTXFiles(ctx context.Context) (validated 
 		return 0, []error{fmt.Errorf("no NATS URL configured")}
 	}
 
+	// Configure NATS replica client with all URLs for automatic failover.
 	client := litestreamnats.NewReplicaClient()
-	client.URL = ic.cfg.NATSURLs[0]
+	client.URL = strings.Join(ic.cfg.NATSURLs, ",")
 	client.BucketName = fmt.Sprintf("convex-%s-wal", ic.cfg.ClusterID)
 	client.Path = ic.cfg.ReplicaPath
 	if ic.cfg.NATSCredentials != "" {
@@ -309,8 +313,9 @@ func (ic *IntegrityChecker) CompareWithReplica(ctx context.Context) (localTXID, 
 		return localTXID, 0, false, nil
 	}
 
+	// Configure NATS replica client with all URLs for automatic failover.
 	client := litestreamnats.NewReplicaClient()
-	client.URL = ic.cfg.NATSURLs[0]
+	client.URL = strings.Join(ic.cfg.NATSURLs, ",")
 	client.BucketName = fmt.Sprintf("convex-%s-wal", ic.cfg.ClusterID)
 	client.Path = ic.cfg.ReplicaPath
 	if ic.cfg.NATSCredentials != "" {

@@ -11,6 +11,7 @@ import (
 
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
+	"github.com/ozanturksever/convex-cluster-manager/internal/natsutil"
 )
 
 // Coordinator errors
@@ -141,16 +142,12 @@ func (c *Coordinator) Start(ctx context.Context) error {
 	// Reset stop channel for restart capability
 	c.stopCh = make(chan struct{})
 
-	// Connect to NATS
-	opts := []nats.Option{
-		nats.MaxReconnects(-1),
-		nats.ReconnectWait(2 * time.Second),
-	}
-	if c.cfg.NATSCreds != "" {
-		opts = append(opts, nats.UserCredentials(c.cfg.NATSCreds))
-	}
-
-	nc, err := nats.Connect(c.cfg.NATSURLs[0], opts...)
+	// Connect to NATS with automatic failover and cluster discovery
+	nc, err := natsutil.Connect(natsutil.ConnectOptions{
+		URLs:        c.cfg.NATSURLs,
+		Credentials: c.cfg.NATSCreds,
+		Logger:      c.logger,
+	})
 	if err != nil {
 		return fmt.Errorf("connect to NATS: %w", err)
 	}

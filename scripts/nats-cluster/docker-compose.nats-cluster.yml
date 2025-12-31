@@ -1,0 +1,85 @@
+# docker-compose.nats-cluster.yml
+# 3-node NATS cluster with JetStream for high availability testing
+#
+# This cluster uses full mesh routing where each node connects to all others.
+# JetStream is enabled for persistent storage and replication.
+#
+# Usage:
+#   docker-compose -f docker-compose.nats-cluster.yml up -d
+#   docker-compose -f docker-compose.nats-cluster.yml down -v
+
+version: "3.8"
+
+services:
+  nats1:
+    image: nats:2.10-alpine
+    container_name: convex-nats-1
+    hostname: nats1
+    command: ["-c", "/etc/nats/nats.conf"]
+    ports:
+      - "4222:4222"   # Client port
+      - "8222:8222"   # HTTP monitoring
+    volumes:
+      - ./nats1.conf:/etc/nats/nats.conf:ro
+      - nats1-data:/data
+    networks:
+      - convex-nats-cluster
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8222/healthz"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  nats2:
+    image: nats:2.10-alpine
+    container_name: convex-nats-2
+    hostname: nats2
+    command: ["-c", "/etc/nats/nats.conf"]
+    ports:
+      - "4223:4222"   # Client port
+      - "8223:8222"   # HTTP monitoring
+    volumes:
+      - ./nats2.conf:/etc/nats/nats.conf:ro
+      - nats2-data:/data
+    networks:
+      - convex-nats-cluster
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8222/healthz"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  nats3:
+    image: nats:2.10-alpine
+    container_name: convex-nats-3
+    hostname: nats3
+    command: ["-c", "/etc/nats/nats.conf"]
+    ports:
+      - "4224:4222"   # Client port
+      - "8224:8222"   # HTTP monitoring
+    volumes:
+      - ./nats3.conf:/etc/nats/nats.conf:ro
+      - nats3-data:/data
+    networks:
+      - convex-nats-cluster
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8222/healthz"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+networks:
+  convex-nats-cluster:
+    name: convex-nats-cluster
+    driver: bridge
+
+volumes:
+  nats1-data:
+  nats2-data:
+  nats3-data:
