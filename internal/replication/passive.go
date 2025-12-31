@@ -133,15 +133,28 @@ func (p *Passive) Running() bool {
 	return p.running
 }
 
+// CatchUpResult contains the result of a CatchUp operation.
+type CatchUpResult struct {
+	// Restored indicates whether data was actually restored from the replica.
+	// If false, it means either no snapshots were available or the replica
+	// was already up to date.
+	Restored bool
+
+	// UpdatedAt is the timestamp of the restored data, if any.
+	UpdatedAt time.Time
+}
+
 // CatchUp performs a one-shot restore from the remote replica into the
 // local shadow database at cfg.DBPath. It uses litestream's Restore
 // planning to choose the appropriate snapshot and WAL files, then
 // atomically replaces the local database file.
 //
 // If no snapshots are available yet (e.g., new cluster or primary hasn't
-// synced yet), CatchUp returns nil without error - the passive node will
-// retry on the next catch-up cycle.
-func (p *Passive) CatchUp(ctx context.Context) error {
+// synced yet), CatchUp returns a result with Restored=false without error -
+// the passive node will retry on the next catch-up cycle.
+//
+// Returns CatchUpResult indicating whether data was actually restored.
+func (p *Passive) CatchUp(ctx context.Context) (CatchUpResult, error) {
 	p.mu.Lock()
 	replica := p.replica
 	client := p.client
@@ -149,10 +162,10 @@ func (p *Passive) CatchUp(ctx context.Context) error {
 	p.mu.Unlock()
 
 	if !running {
-		return fmt.Errorf("passive replication not started")
+		return CatchUpResult{}, fmt.Errorf("passive replication not started")
 	}
 	if replica == nil || client == nil {
-		return fmt.Errorf("replica not initialized")
+		return CatchUpResult{}, fmt.Errorf("replica not initialized")
 	}
 
 	// Initialize the NATS client connection before attempting restore.
@@ -161,9 +174,9 @@ func (p *Passive) CatchUp(ctx context.Context) error {
 		// Check if this is a "no bucket" or similar situation - not an error for passive.
 		if isPassiveNoSnapshotsError(err) {
 			p.logger.Debug("NATS object store not ready yet", "error", err)
-			return nil
+			return CatchUpResult{Restored: false}, nil
 		}
-		return fmt.Errorf("init nats client: %w", err)
+		return CatchUpResult{}, fmt.Errorf("init nats client: %w", err)
 	}
 
 	// Restore to a temporary file first, then atomically move into place.
@@ -184,15 +197,15 @@ func (p *Passive) CatchUp(ctx context.Context) error {
 		// Check if this is a "no snapshots" situation - not an error for passive.
 		if isPassiveNoSnapshotsError(err) {
 			p.logger.Debug("no snapshots available yet for catch-up")
-			return nil
+			return CatchUpResult{Restored: false}, nil
 		}
-		return fmt.Errorf("calc restore target: %w", err)
+		return CatchUpResult{}, fmt.Errorf("calc restore target: %w", err)
 	}
 
 	// If updatedAt is zero, there's nothing to restore yet.
 	if updatedAt.IsZero() {
 		p.logger.Debug("no restore target available yet")
-		return nil
+		return CatchUpResult{Restored: false}, nil
 	}
 
 	if err := replica.Restore(ctx, opt); err != nil {
@@ -204,16 +217,16 @@ func (p *Passive) CatchUp(ctx context.Context) error {
 		// Check for no snapshots error during restore.
 		if isPassiveNoSnapshotsError(err) || errors.Is(err, litestream.ErrNoSnapshots) {
 			p.logger.Debug("no snapshots available for restore")
-			return nil
+			return CatchUpResult{Restored: false}, nil
 		}
-		return fmt.Errorf("restore from replica: %w", err)
+		return CatchUpResult{}, fmt.Errorf("restore from replica: %w", err)
 	}
 
 	// Ensure output directory exists.
 	outputDir := filepath.Dir(p.cfg.DBPath)
 	if err := os.MkdirAll(outputDir, 0755); err != nil {
 		_ = os.Remove(tmpPath)
-		return fmt.Errorf("create output directory: %w", err)
+		return CatchUpResult{}, fmt.Errorf("create output directory: %w", err)
 	}
 
 	// Remove existing database files before moving the new one into place.
@@ -225,7 +238,7 @@ func (p *Passive) CatchUp(ctx context.Context) error {
 	// Atomically move the temp file into place.
 	if err := os.Rename(tmpPath, p.cfg.DBPath); err != nil {
 		_ = os.Remove(tmpPath)
-		return fmt.Errorf("rename temp db to final path: %w", err)
+		return CatchUpResult{}, fmt.Errorf("rename temp db to final path: %w", err)
 	}
 
 	p.mu.Lock()
@@ -234,7 +247,7 @@ func (p *Passive) CatchUp(ctx context.Context) error {
 
 	p.logger.Info("passive replica caught up", "updatedAt", updatedAt)
 
-	return nil
+	return CatchUpResult{Restored: true, UpdatedAt: updatedAt}, nil
 }
 
 // ReplicationLag returns how far behind the passive node is relative to

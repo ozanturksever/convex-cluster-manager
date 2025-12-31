@@ -213,7 +213,9 @@ func TestPassiveCatchUpEliminatesLag(t *testing.T) {
 	defer func() { _ = passive.Stop(context.Background()) }()
 
 	// Perform a catch-up restore from NATS into the shadow DB.
-	require.NoError(t, passive.CatchUp(ctx))
+	result, err := passive.CatchUp(ctx)
+	require.NoError(t, err)
+	assert.True(t, result.Restored, "CatchUp should have restored data")
 
 	// Verify that the shadow DB now contains the same number of rows as the primary.
 	var primaryCount int

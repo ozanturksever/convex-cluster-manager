@@ -222,7 +222,11 @@ func (d *Daemon) handleBecomeLeader() {
 	// This ensures we have the latest data from the previous primary.
 	// We use a dedicated context with timeout to avoid being cancelled prematurely.
 	// We also retry multiple times to handle transient failures.
-	catchUpSucceeded := false
+	//
+	// IMPORTANT: We now track whether data was actually restored (not just whether
+	// the call succeeded). This is critical because CatchUp can "succeed" without
+	// restoring any data if no snapshots are available yet.
+	dataRestored := false
 	if d.passive != nil && d.passive.Running() {
 		d.logger.Info("performing final catch-up before promotion")
 		
@@ -233,12 +237,19 @@ func (d *Daemon) handleBecomeLeader() {
 		
 		for attempt := 1; attempt <= maxRetries; attempt++ {
 			catchUpCtx, cancelCatchUp := context.WithTimeout(context.Background(), catchUpTimeout)
-			err := d.passive.CatchUp(catchUpCtx)
+			result, err := d.passive.CatchUp(catchUpCtx)
 			cancelCatchUp()
 			
 			if err == nil {
-				d.logger.Info("final catch-up succeeded", "attempt", attempt)
-				catchUpSucceeded = true
+				if result.Restored {
+					d.logger.Info("final catch-up succeeded with data restore", 
+						"attempt", attempt,
+						"updatedAt", result.UpdatedAt)
+					dataRestored = true
+				} else {
+					d.logger.Info("final catch-up succeeded but no data restored (no snapshots available)", 
+						"attempt", attempt)
+				}
 				break
 			}
 			
@@ -253,8 +264,8 @@ func (d *Daemon) handleBecomeLeader() {
 			}
 		}
 		
-		if !catchUpSucceeded {
-			d.logger.Warn("all catch-up attempts failed, will NOT promote replica to data path")
+		if !dataRestored {
+			d.logger.Warn("no data was restored during catch-up, will NOT promote replica to data path")
 		}
 	}
 
@@ -268,18 +279,21 @@ func (d *Daemon) handleBecomeLeader() {
 		cancelStop()
 	}
 
-	// Promote the replica database to the data path ONLY if catch-up succeeded.
-	// This is critical for data integrity - if catch-up failed, the replica may
-	// be stale and promoting it would overwrite newer data on the data path.
+	// Promote the replica database to the data path ONLY if data was actually restored.
+	// This is critical for data integrity - if no data was restored, the replica may
+	// be stale or empty, and promoting it would overwrite newer data on the data path.
 	// In that case, we let the backend start with whatever data is available
 	// on the data path (which may be more recent than a stale replica).
-	if catchUpSucceeded {
-		if err := d.promoteReplicaToData(ctx); err != nil {
+	//
+	// When dataRestored is true, we force the promotion because we KNOW the replica
+	// contains the latest data from NATS - no need to compare database versions.
+	if dataRestored {
+		if err := d.forcePromoteReplicaToData(ctx); err != nil {
 			d.logger.Error("failed to promote replica to data path", "error", err)
 			// Continue anyway - the backend will use whatever data is available
 		}
 	} else {
-		d.logger.Warn("skipping replica promotion due to failed catch-up - using existing data path")
+		d.logger.Warn("skipping replica promotion - no data was restored from NATS")
 	}
 
 	// Acquire VIP.
@@ -418,7 +432,7 @@ func (d *Daemon) handleStepDown() {
 		return
 	}
 
-	if err := d.passive.CatchUp(stepDownCtx); err != nil {
+	if _, err := d.passive.CatchUp(stepDownCtx); err != nil {
 		d.logger.Error("failed to catch up passive replica", "error", err)
 		return
 	}
@@ -428,6 +442,17 @@ func (d *Daemon) handleStepDown() {
 	}
 }
 
+// forcePromoteReplicaToData unconditionally copies the replica database to the
+// data path. This should be called when we KNOW the replica contains the latest
+// data (i.e., after a successful CatchUp that actually restored data).
+//
+// Unlike promoteReplicaToData, this function does not compare database versions -
+// it always promotes because we have authoritative knowledge that the replica
+// contains the latest data from NATS.
+func (d *Daemon) forcePromoteReplicaToData(_ context.Context) error {
+	return d.doPromoteReplicaToData(true)
+}
+
 // promoteReplicaToData copies the replica database to the data path if the
 // replica contains newer data. This is essential for data integrity during
 // failover scenarios where the passive node has received WAL updates from
@@ -435,7 +460,17 @@ func (d *Daemon) handleStepDown() {
 //
 // The function compares the transaction IDs (via page count as a proxy) of
 // both databases and only copies if the replica is newer.
+//
+// NOTE: Prefer forcePromoteReplicaToData when you know the replica was just
+// restored from NATS, as this function's comparison logic may be unreliable.
 func (d *Daemon) promoteReplicaToData(_ context.Context) error {
+	return d.doPromoteReplicaToData(false)
+}
+
+// doPromoteReplicaToData is the internal implementation for promoting the replica
+// database to the data path. If force is true, it skips the version comparison
+// and always promotes. If force is false, it only promotes if the replica is newer.
+func (d *Daemon) doPromoteReplicaToData(force bool) error {
 	replicaPath := d.cfg.WAL.ReplicaPath
 	dataPath := d.cfg.Backend.DataPath
 
@@ -448,57 +483,65 @@ func (d *Daemon) promoteReplicaToData(_ context.Context) error {
 		return fmt.Errorf("stat replica: %w", err)
 	}
 
-	// Check if data path exists
-	dataInfo, dataErr := os.Stat(dataPath)
-	dataExists := dataErr == nil
+	// Determine if we should promote
+	shouldPromote := force
 
-	// Compare databases to determine if replica is newer
-	replicaNewer := false
+	if !force {
+		// Check if data path exists
+		dataInfo, dataErr := os.Stat(dataPath)
+		dataExists := dataErr == nil
 
-	if !dataExists {
-		// No data file exists, replica is definitely newer
-		replicaNewer = true
-		d.logger.Info("data path does not exist, will use replica", "replica", replicaPath, "data", dataPath)
-	} else {
-		// Both exist - try TXID comparison first (most accurate), fall back to mtime
-		replicaTxID, err1 := d.getDBTxID(replicaPath)
-		dataTxID, err2 := d.getDBTxID(dataPath)
-
-		if err1 == nil && err2 == nil {
-			// TXID comparison is authoritative
-			if replicaTxID > dataTxID {
-				replicaNewer = true
-				d.logger.Info("replica has higher transaction ID",
-					"replica_txid", replicaTxID,
-					"data_txid", dataTxID)
-			} else {
-				d.logger.Info("data path is up to date, no promotion needed",
-					"replica_txid", replicaTxID,
-					"data_txid", dataTxID)
-			}
+		if !dataExists {
+			// No data file exists, replica is definitely newer
+			shouldPromote = true
+			d.logger.Info("data path does not exist, will use replica", "replica", replicaPath, "data", dataPath)
 		} else {
-			// Fall back to mtime comparison if we can't read TXIDs
-			d.logger.Warn("could not compare database TXIDs, falling back to mtime",
-				"replica_err", err1,
-				"data_err", err2)
-			if replicaInfo.ModTime().After(dataInfo.ModTime()) {
-				replicaNewer = true
-				d.logger.Info("replica is newer than data (by mtime)",
-					"replica_mtime", replicaInfo.ModTime(),
-					"data_mtime", dataInfo.ModTime())
+			// Both exist - try TXID comparison first (most accurate), fall back to mtime
+			replicaTxID, err1 := d.getDBTxID(replicaPath)
+			dataTxID, err2 := d.getDBTxID(dataPath)
+
+			if err1 == nil && err2 == nil {
+				// TXID comparison is authoritative
+				if replicaTxID > dataTxID {
+					shouldPromote = true
+					d.logger.Info("replica has higher transaction ID",
+						"replica_txid", replicaTxID,
+						"data_txid", dataTxID)
+				} else {
+					d.logger.Info("data path is up to date, no promotion needed",
+						"replica_txid", replicaTxID,
+						"data_txid", dataTxID)
+				}
+			} else {
+				// Fall back to mtime comparison if we can't read TXIDs
+				d.logger.Warn("could not compare database TXIDs, falling back to mtime",
+					"replica_err", err1,
+					"data_err", err2)
+				if replicaInfo.ModTime().After(dataInfo.ModTime()) {
+					shouldPromote = true
+					d.logger.Info("replica is newer than data (by mtime)",
+						"replica_mtime", replicaInfo.ModTime(),
+						"data_mtime", dataInfo.ModTime())
+				}
 			}
 		}
 	}
 
-	if !replicaNewer {
+	if !shouldPromote {
 		d.logger.Debug("replica is not newer, skipping promotion")
 		return nil
 	}
 
 	// Promote: copy replica to data path atomically
-	d.logger.Info("promoting replica to data path",
-		"replica", replicaPath,
-		"data", dataPath)
+	if force {
+		d.logger.Info("force promoting replica to data path (data was restored from NATS)",
+			"replica", replicaPath,
+			"data", dataPath)
+	} else {
+		d.logger.Info("promoting replica to data path",
+			"replica", replicaPath,
+			"data", dataPath)
+	}
 
 	// Ensure data directory exists
 	dataDir := filepath.Dir(dataPath)
@@ -681,7 +724,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 			// Final best-effort catch-up when running as passive.
 			if !d.election.IsLeader() && d.passive != nil && d.passive.Running() {
-				if err := d.passive.CatchUp(context.Background()); err != nil {
+				if _, err := d.passive.CatchUp(context.Background()); err != nil {
 					d.logger.Error("final passive catch-up error", "error", err)
 				}
 			}
@@ -761,7 +804,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 				if err := d.passive.Start(ctx); err != nil {
 					d.logger.Error("failed to start passive replication", "error", err)
 				} else {
-					if err := d.passive.CatchUp(ctx); err != nil {
+					if _, err := d.passive.CatchUp(ctx); err != nil {
 						d.logger.Error("passive catch-up error", "error", err)
 					} else if lag, err := d.passive.ReplicationLag(ctx); err == nil {
 						d.health.SetReplicationLag(uint64(lag.Milliseconds()))
